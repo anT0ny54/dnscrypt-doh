@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -24,7 +25,7 @@ import (
 const (
 	defaultPort            = "8080"
 	defaultDoHPath         = "/dns-query"
-	fixedUpstreamURL       = "http://127.0.0.1:8053/dns-query"
+	fixedUpstreamURL       = "https://127.0.0.1:8053/dns-query"
 	defaultRateLimit       = 99
 	defaultRateWindowSec   = 60
 	defaultMaxBodyBytes    = 65535
@@ -528,7 +529,14 @@ func main() {
 	}
 
 	transport := &http.Transport{
-		Proxy:                 nil,
+		Proxy: nil,
+		TLSClientConfig: &tls.Config{
+			// dnscrypt-proxy's local DoH service uses its bundled localhost
+			// self-signed certificate. This transport is used only for the
+			// fixed loopback upstream, never for public destinations.
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
+		},
 		MaxIdleConns:          64,
 		MaxIdleConnsPerHost:   32,
 		MaxConnsPerHost:       64,

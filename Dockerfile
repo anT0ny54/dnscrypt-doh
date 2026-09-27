@@ -53,11 +53,14 @@ RUN apk add --no-cache ca-certificates tzdata && \
 
 COPY --from=build /out/dnscrypt-proxy /usr/local/bin/dnscrypt-proxy
 COPY --from=build /out/doh-gateway /usr/local/bin/doh-gateway
+# dnscrypt-proxy's local DoH server uses the bundled localhost TLS certificate.
+COPY --from=build /build/dnscrypt/localhost.pem /etc/localhost.pem
 COPY dnscrypt-proxy.toml /etc/dnscrypt-proxy.toml
 COPY entrypoint.sh /entrypoint.sh
 
 RUN chmod 0755 /usr/local/bin/dnscrypt-proxy /usr/local/bin/doh-gateway /entrypoint.sh && \
-    chown doh:doh /usr/local/bin/dnscrypt-proxy /usr/local/bin/doh-gateway /etc/dnscrypt-proxy.toml /entrypoint.sh
+    chmod 0600 /etc/localhost.pem && \
+    chown doh:doh /usr/local/bin/dnscrypt-proxy /usr/local/bin/doh-gateway /etc/localhost.pem /etc/dnscrypt-proxy.toml /entrypoint.sh
 
 ENV GOMAXPROCS=1 \
     GOGC=75 \
