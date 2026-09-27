@@ -16,8 +16,6 @@ dnscrypt_servers = false
 doh_servers = true
 odoh_servers = false
 http3 = false
-http3_probe = false
-pqdnscrypt = false
 
 # Upstream transport / resolver selection.
 timeout = 5000
