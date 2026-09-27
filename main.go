@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,53 +22,64 @@ import (
 )
 
 const (
-	defaultPort          = "8080"
-	defaultDoHPath       = "/dns-query"
-	defaultUpstream      = "http://127.0.0.1:8053/dns-query"
-	defaultRateLimit     = 99
-	defaultRateWindowSec = 60
-	defaultMaxBodyBytes  = 65535
-	defaultConcurrency   = 128
-	defaultClientEntries = 250000
-	shardCount           = 64
-	upstreamTimeout      = 6 * time.Second
+	defaultPort            = "8080"
+	defaultDoHPath         = "/dns-query"
+	fixedUpstreamURL       = "http://127.0.0.1:8053/dns-query"
+	defaultRateLimit       = 99
+	defaultRateWindowSec   = 60
+	defaultMaxBodyBytes    = 65535
+	defaultConcurrency     = 128
+	defaultClientEntries   = 250000
+	defaultMaxHeaderBytes  = 16 << 10
+	defaultMaxGetQuerySize = 12 << 10
+	minMaxBodyBytes        = 512
+	maxMaxBodyBytes        = 65535
+	maxRateLimit           = 1000000
+	maxRateWindowSec       = 86400
+	maxConcurrency         = 512
+	maxClientEntries       = 1000000
+	maxDNSNameBytes        = 255
+	maxDNSRecords          = 4096
+	shardCount             = 64
+	upstreamTimeout        = 6 * time.Second
 )
 
 type rateEntry struct {
 	window uint64
-	count  uint16
+	count  uint32
 }
 
 type rateShard struct {
 	mu sync.Mutex
-	m  map[netip.Addr]*rateEntry
+	m  map[netip.Addr]rateEntry
 }
 
 type rateLimiter struct {
 	shards             [shardCount]rateShard
-	limit              uint16
+	limit              uint32
 	windowSec          uint64
 	maxEntriesPerShard int
 }
 
-func newRateLimiter(limit int, windowSec int, maxEntries int) *rateLimiter {
-	if limit < 1 {
+func newRateLimiter(limit, windowSec, maxEntries int) *rateLimiter {
+	if limit < 1 || limit > maxRateLimit {
 		limit = defaultRateLimit
 	}
-	if windowSec < 1 {
+	if windowSec < 1 || windowSec > maxRateWindowSec {
 		windowSec = defaultRateWindowSec
 	}
-	if maxEntries < shardCount {
+	if maxEntries < shardCount || maxEntries > maxClientEntries {
 		maxEntries = defaultClientEntries
 	}
 	r := &rateLimiter{
-		limit:              uint16(limit),
-		windowSec:          uint64(windowSec),
-		maxEntriesPerShard: (maxEntries + shardCount - 1) / shardCount,
+		limit:     uint32(limit),
+		windowSec: uint64(windowSec),
+		// Use floor division so the aggregate shard capacity never exceeds
+		// the configured client-entry limit.
+		maxEntriesPerShard: maxEntries / shardCount,
 	}
-	for i := range r.shards {
-		r.shards[i].m = make(map[netip.Addr]*rateEntry, r.maxEntriesPerShard)
-	}
+	// Allocate shard maps lazily. A large MAX_CLIENT_IPS value should not
+	// reserve map buckets for every shard before the first client arrives.
 	return r
 }
 
@@ -97,19 +110,15 @@ func (r *rateLimiter) allow(ip netip.Addr) bool {
 	entry, ok := sh.m[ip]
 	if !ok {
 		if len(sh.m) >= r.maxEntriesPerShard {
-			// Only scan when a shard is full. Remove one expired identity if possible.
-			for k, v := range sh.m {
-				if v.window != nowWindow {
-					delete(sh.m, k)
-					break
-				}
-			}
-			if len(sh.m) >= r.maxEntriesPerShard {
-				return false
-			}
+			// Periodic cleanup owns expiration. Do not scan a full shard on the
+			// request path, or a client churn burst could turn this into O(n)
+			// work per rejected identity.
+			return false
 		}
-		entry = &rateEntry{window: nowWindow}
-		sh.m[ip] = entry
+		entry = rateEntry{window: nowWindow}
+	}
+	if sh.m == nil {
+		sh.m = make(map[netip.Addr]rateEntry, r.maxEntriesPerShard)
 	}
 
 	if entry.window != nowWindow {
@@ -120,6 +129,7 @@ func (r *rateLimiter) allow(ip netip.Addr) bool {
 		return false
 	}
 	entry.count++
+	sh.m[ip] = entry
 	return true
 }
 
@@ -155,9 +165,9 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-func getenvInt(key string, fallback int) int {
+func getenvInt(key string, fallback, min, max int) int {
 	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
-	if err != nil || v <= 0 {
+	if err != nil || v < min || v > max {
 		return fallback
 	}
 	return v
@@ -165,37 +175,48 @@ func getenvInt(key string, fallback int) int {
 
 func getenvBool(key string, fallback bool) bool {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
-	if v == "" {
+	switch v {
+	case "":
+		return fallback
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
 		return fallback
 	}
-	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
+	parse := func(value string) netip.Addr {
+		ip, err := netip.ParseAddr(strings.TrimSpace(value))
+		if err != nil {
+			return netip.Addr{}
+		}
+		return ip.Unmap()
+	}
+
 	if trustProxy {
-		if h := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); h != "" {
-			if ip, err := netip.ParseAddr(h); err == nil {
+		if h := r.Header.Get("CF-Connecting-IP"); h != "" {
+			if ip := parse(h); ip.IsValid() {
 				return ip
 			}
 		}
-		if h := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); h != "" {
-			if first := strings.TrimSpace(strings.Split(h, ",")[0]); first != "" {
-				if ip, err := netip.ParseAddr(first); err == nil {
+		if h := r.Header.Get("X-Forwarded-For"); h != "" {
+			if first := strings.TrimSpace(strings.SplitN(h, ",", 2)[0]); first != "" {
+				if ip := parse(first); ip.IsValid() {
 					return ip
 				}
 			}
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		if ip, e := netip.ParseAddr(host); e == nil {
+
+	if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil {
+		if ip := parse(host); ip.IsValid() {
 			return ip
 		}
 	}
-	if ip, err := netip.ParseAddr(strings.TrimSpace(r.RemoteAddr)); err == nil {
-		return ip
-	}
-	return netip.Addr{}
+	return parse(r.RemoteAddr)
 }
 
 func doHPath(path, configured string) bool {
@@ -217,6 +238,153 @@ func isDNSMessageContentType(v string) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(strings.Split(v, ";")[0]), "application/dns-message")
+}
+
+// dnsNameEnd validates a DNS name, including compression pointers, and returns
+// the number of bytes consumed at the containing offset.
+func dnsNameEnd(msg []byte, offset int) (int, bool) {
+	if offset < 0 || offset >= len(msg) {
+		return 0, false
+	}
+
+	next := offset
+	jumped := false
+	jumps := 0
+	nameLen := 0
+	for {
+		if offset >= len(msg) {
+			return 0, false
+		}
+		labelLen := msg[offset]
+		switch {
+		case labelLen == 0:
+			nameLen++ // terminating root label
+			if nameLen > maxDNSNameBytes {
+				return 0, false
+			}
+			if jumped {
+				return next, true
+			}
+			return offset + 1, true
+		case labelLen&0xc0 == 0xc0:
+			if offset+1 >= len(msg) {
+				return 0, false
+			}
+			pointer := int(labelLen&0x3f)<<8 | int(msg[offset+1])
+			// DNS compression pointers must point backwards to an earlier
+			// label occurrence. A forward pointer is not a valid DNS name.
+			if pointer < 12 || pointer >= offset || pointer >= len(msg) {
+				return 0, false
+			}
+			if !jumped {
+				next = offset + 2
+			}
+			jumped = true
+			offset = pointer
+			jumps++
+			if jumps > 128 {
+				return 0, false
+			}
+		case labelLen&0xc0 != 0:
+			return 0, false
+		default:
+			if labelLen > 63 || offset+1+int(labelLen) > len(msg) {
+				return 0, false
+			}
+			nameLen += 1 + int(labelLen)
+			if nameLen > maxDNSNameBytes {
+				return 0, false
+			}
+			offset += 1 + int(labelLen)
+		}
+	}
+}
+
+func validDNSMessage(msg []byte, wantResponse bool) bool {
+	if len(msg) < 12 {
+		return false
+	}
+	flags := binary.BigEndian.Uint16(msg[2:4])
+	if (flags&0x8000 != 0) != wantResponse {
+		return false
+	}
+	qdCount := int(binary.BigEndian.Uint16(msg[4:6]))
+	anCount := int(binary.BigEndian.Uint16(msg[6:8]))
+	nsCount := int(binary.BigEndian.Uint16(msg[8:10]))
+	arCount := int(binary.BigEndian.Uint16(msg[10:12]))
+	if qdCount != 1 {
+		return false
+	}
+
+	recordCount := anCount + nsCount + arCount
+	if recordCount > maxDNSRecords {
+		return false
+	}
+
+	offset := 12
+	for i := 0; i < qdCount; i++ {
+		var ok bool
+		if offset, ok = dnsNameEnd(msg, offset); !ok || offset+4 > len(msg) {
+			return false
+		}
+		offset += 4 // QTYPE + QCLASS
+	}
+
+	for i := 0; i < recordCount; i++ {
+		var ok bool
+		if offset, ok = dnsNameEnd(msg, offset); !ok || offset+10 > len(msg) {
+			return false
+		}
+		rdataLen := int(binary.BigEndian.Uint16(msg[offset+8 : offset+10]))
+		offset += 10
+		if offset+rdataLen > len(msg) {
+			return false
+		}
+		offset += rdataLen
+	}
+
+	return offset == len(msg)
+}
+
+func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int) {
+	if r.Method == http.MethodPost {
+		if !isDNSMessageContentType(r.Header.Get("Content-Type")) {
+			return nil, http.StatusUnsupportedMediaType
+		}
+		if r.ContentLength > maxBody {
+			return nil, http.StatusRequestEntityTooLarge
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+		if err != nil {
+			return nil, http.StatusBadRequest
+		}
+		if int64(len(body)) > maxBody {
+			return nil, http.StatusRequestEntityTooLarge
+		}
+		if !validDNSMessage(body, false) {
+			return nil, http.StatusBadRequest
+		}
+		return body, 0
+	}
+
+	encoded := r.URL.Query().Get("dns")
+	if encoded == "" {
+		return nil, http.StatusBadRequest
+	}
+	if len(encoded) > defaultMaxGetQuerySize {
+		return nil, http.StatusRequestURITooLong
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, http.StatusBadRequest
+	}
+	if int64(len(decoded)) > maxBody {
+		return nil, http.StatusRequestEntityTooLarge
+	}
+	if !validDNSMessage(decoded, false) {
+		return nil, http.StatusBadRequest
+	}
+	return decoded, 0
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
@@ -258,8 +426,23 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 
 	ip := parseClientIP(r, s.trustProxy)
 	if !s.rate.allow(ip) {
-		w.Header().Set("Retry-After", "60")
+		w.Header().Set("Retry-After", strconv.FormatUint(s.rate.windowSec, 10))
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
+		return
+	}
+
+	query, status := readDNSQuery(r, s.maxBody)
+	if status != 0 {
+		switch status {
+		case http.StatusUnsupportedMediaType:
+			writeJSON(w, status, map[string]string{"error": "Content-Type must be application/dns-message"})
+		case http.StatusRequestEntityTooLarge:
+			writeJSON(w, status, map[string]string{"error": "DNS message exceeds configured size limit"})
+		case http.StatusRequestURITooLong:
+			writeJSON(w, status, map[string]string{"error": "dns query parameter too large"})
+		default:
+			writeJSON(w, status, map[string]string{"error": "invalid DNS query"})
+		}
 		return
 	}
 
@@ -272,49 +455,16 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Method == http.MethodPost {
-		if !isDNSMessageContentType(r.Header.Get("Content-Type")) {
-			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/dns-message"})
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, s.maxBody)
-	} else {
-		encoded := r.URL.Query().Get("dns")
-		if encoded == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing dns query parameter"})
-			return
-		}
-		if len(encoded) > 90000 {
-			writeJSON(w, http.StatusRequestURITooLong, map[string]string{"error": "dns query parameter too large"})
-			return
-		}
-		if _, err := base64.RawURLEncoding.DecodeString(encoded); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid base64url dns query"})
-			return
-		}
-	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), upstreamTimeout)
 	defer cancel()
 
-	uReq := r.Clone(ctx)
-	uReq.URL.Scheme = s.upstream.Scheme
-	uReq.URL.Host = s.upstream.Host
-	uReq.URL.Path = s.upstream.Path
-	if s.upstream.RawQuery != "" {
-		uReq.URL.RawQuery = s.upstream.RawQuery
-	}
-	uReq.Host = s.upstream.Host
-	uReq.RequestURI = ""
-
-	// Do not forward client/proxy identity to the local dnscrypt-proxy instance.
-	for _, h := range []string{
-		"Connection", "Proxy-Connection", "Keep-Alive", "TE", "Trailer", "Transfer-Encoding", "Upgrade",
-		"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "CF-Connecting-IP", "CF-Ray",
-	} {
-		uReq.Header.Del(h)
+	uReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.upstream.String(), bytes.NewReader(query))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "dns upstream unavailable"})
+		return
 	}
 	uReq.Header.Set("Accept", "application/dns-message")
+	uReq.Header.Set("Content-Type", "application/dns-message")
 
 	resp, err := s.client.Do(uReq)
 	if err != nil {
@@ -327,30 +477,54 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, s.maxBody+1))
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "dns upstream returned an invalid HTTP status"})
+		return
 	}
+	if !isDNSMessageContentType(resp.Header.Get("Content-Type")) {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "dns upstream returned an invalid content type"})
+		return
+	}
+	if resp.ContentLength > s.maxBody {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "dns upstream response exceeds configured size limit"})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, s.maxBody+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
+		return
+	}
+	if int64(len(body)) > s.maxBody || !validDNSMessage(body, true) {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
+		return
+	}
+	if len(body) < 2 || len(query) < 2 || binary.BigEndian.Uint16(body[:2]) != binary.BigEndian.Uint16(query[:2]) {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "DNS response ID mismatch"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/dns-message")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, io.LimitReader(resp.Body, s.maxBody))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func main() {
 	port := getenv("PORT", defaultPort)
 	dohPath := getenv("DOH_PATH", defaultDoHPath)
-	upstreamRaw := getenv("DOH_UPSTREAM", defaultUpstream)
-	rateLimit := getenvInt("RATE_LIMIT", defaultRateLimit)
-	rateWindow := getenvInt("RATE_WINDOW_SECONDS", defaultRateWindowSec)
-	maxBody := getenvInt("MAX_DNS_MESSAGE_BYTES", defaultMaxBodyBytes)
-	maxConcurrency := getenvInt("MAX_CONCURRENCY", defaultConcurrency)
-	maxClients := getenvInt("MAX_CLIENT_IPS", defaultClientEntries)
+	rateLimit := getenvInt("RATE_LIMIT", defaultRateLimit, 1, maxRateLimit)
+	rateWindow := getenvInt("RATE_WINDOW_SECONDS", defaultRateWindowSec, 1, maxRateWindowSec)
+	maxBody := getenvInt("MAX_DNS_MESSAGE_BYTES", defaultMaxBodyBytes, minMaxBodyBytes, maxMaxBodyBytes)
+	maxConcurrency := getenvInt("MAX_CONCURRENCY", defaultConcurrency, 1, maxConcurrency)
+	maxClients := getenvInt("MAX_CLIENT_IPS", defaultClientEntries, shardCount, maxClientEntries)
 	trustProxy := getenvBool("TRUST_PROXY_HEADERS", true)
 
-	upstream, err := url.Parse(upstreamRaw)
-	if err != nil || upstream.Scheme == "" || upstream.Host == "" || upstream.Path == "" {
-		log.Fatalf("invalid DOH_UPSTREAM: %q", upstreamRaw)
+	upstream, err := url.Parse(fixedUpstreamURL)
+	if err != nil {
+		log.Fatalf("invalid fixed DoH upstream: %v", err)
 	}
 
 	transport := &http.Transport{
@@ -366,7 +540,15 @@ func main() {
 	}
 
 	s := &server{
-		client:     &http.Client{Transport: transport, Timeout: upstreamTimeout},
+		client: &http.Client{
+			Transport: transport,
+			Timeout:   upstreamTimeout,
+			// Do not follow redirects: the gateway must validate the actual
+			// upstream response status before forwarding anything to clients.
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		upstream:   upstream,
 		dohPath:    dohPath,
 		rate:       newRateLimiter(rateLimit, rateWindow, maxClients),
@@ -405,11 +587,11 @@ func main() {
 		ReadTimeout:       7 * time.Second,
 		WriteTimeout:      7 * time.Second,
 		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    16 << 10,
+		MaxHeaderBytes:    defaultMaxHeaderBytes,
 	}
 
-	log.Printf("DoH gateway listening on 0.0.0.0:%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d trustProxy=%t",
-		port, dohPath, upstream.String(), rateLimit, rateWindow, maxClients, maxConcurrency, trustProxy)
+	log.Printf("DoH gateway listening on 0.0.0.0:%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
+		port, dohPath, fixedUpstreamURL, rateLimit, rateWindow, maxClients, maxConcurrency, maxBody, trustProxy)
 
 	err = h.ListenAndServe()
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {

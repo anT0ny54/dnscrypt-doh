@@ -3,14 +3,14 @@
 FROM alpine:3.24.1 AS build
 ARG TARGETARCH
 ARG GO_VERSION=1.23.2
-ARG DNSCRYPT_VERSION=2.1.18
+ARG DNSCRYPT_VERSION=2.1.5
 
-RUN apk add --no-cache ca-certificates wget tar git build-base
+RUN apk add --no-cache ca-certificates wget tar
 
 WORKDIR /build
 
 # Install exactly Go 1.23.2; Alpine 3.24 itself ships a newer Go toolchain,
-# so the build stage pins the requested compiler explicitly.
+# so the build stage pins a reproducible compiler explicitly.
 RUN set -eux; \
     case "${TARGETARCH}" in \
       amd64) GO_ARCH=amd64; GO_SHA=542d3c1705f1c6a1c5a80d5dc62e2e45171af291e755d591c5e6531ef63b454e ;; \
@@ -24,7 +24,7 @@ RUN set -eux; \
 ENV PATH=/usr/local/go/bin:$PATH
 ENV CGO_ENABLED=0
 
-# Pin dnscrypt-proxy 2.1.18 and build a small static binary.
+# Pin dnscrypt-proxy 2.1.5 and build a small static binary.
 RUN set -eux; \
     wget -q "https://github.com/DNSCrypt/dnscrypt-proxy/archive/refs/tags/${DNSCRYPT_VERSION}.tar.gz" -O /tmp/dnscrypt.tar.gz; \
     mkdir -p /build/dnscrypt; \
@@ -35,10 +35,11 @@ RUN set -eux; \
     /out/dnscrypt-proxy -version; \
     /out/dnscrypt-proxy -config /dev/null -version >/dev/null
 
-COPY main.go go.mod /build/gateway/
+COPY main.go main_test.go go.mod /build/gateway/
 RUN set -eux; \
     cd /build/gateway; \
-    go mod tidy; \
+    go test ./...; \
+    go vet ./...; \
     go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .; \
     /out/doh-gateway >/tmp/gateway-check.log 2>&1 & pid=$!; \
     sleep 1; \
@@ -64,7 +65,6 @@ ENV GOMAXPROCS=1 \
     GOMEMLIMIT=192MiB \
     PORT=8080 \
     DOH_PATH=/dns-query \
-    DOH_UPSTREAM=http://127.0.0.1:8053/dns-query \
     RATE_LIMIT=99 \
     RATE_WINDOW_SECONDS=60 \
     MAX_DNS_MESSAGE_BYTES=65535 \
