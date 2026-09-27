@@ -49,8 +49,7 @@ RUN set -eux; \
 FROM alpine:3.24.1 AS runtime
 
 RUN apk add --no-cache ca-certificates tzdata && \
-    addgroup -S doh && adduser -S -D -H -G doh doh && \
-    mkdir -p /etc/dnscrypt && chown -R doh:doh /etc/dnscrypt
+    addgroup -S doh && adduser -S -D -H -G doh doh
 
 COPY --from=build /out/dnscrypt-proxy /usr/local/bin/dnscrypt-proxy
 COPY --from=build /out/doh-gateway /usr/local/bin/doh-gateway

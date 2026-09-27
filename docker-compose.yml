@@ -6,14 +6,13 @@ services:
         TARGETARCH: amd64
     ports:
       - "8080:8080"
-    environment:
-      PORT: 8080
-      GOMAXPROCS: 1
-      GOGC: 75
-      GOMEMLIMIT: 192MiB
-      RATE_LIMIT: 99
-      RATE_WINDOW_SECONDS: 60
-      MAX_CONCURRENCY: 128
-      MAX_CLIENT_IPS: 250000
-      TRUST_PROXY_HEADERS: "true"
+    # No environment overrides here: every value previously listed in this
+    # block (PORT, GOMAXPROCS, GOGC, GOMEMLIMIT, RATE_LIMIT,
+    # RATE_WINDOW_SECONDS, MAX_CONCURRENCY, MAX_CLIENT_IPS,
+    # TRUST_PROXY_HEADERS) just restated the image's own baked-in Dockerfile
+    # ENV defaults, so it changed nothing and only risked drifting out of
+    # sync with the Dockerfile over time. To actually override a default for
+    # local testing, uncomment and edit below:
+    # environment:
+    #   RATE_LIMIT: 20
     restart: unless-stopped

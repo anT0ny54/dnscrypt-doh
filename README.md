@@ -44,7 +44,7 @@ Go DoH gateway
         v
  dnscrypt-proxy 2.1.5
   - small in-memory cache
-  - wp2 load balancing
+  - p2 load balancing
   - 3 pinned HaGeZi DoH upstreams
 ```
 
@@ -125,3 +125,4 @@ The build verifies the SHA-256 checksum of the downloaded Go toolchain for amd64
 - `entrypoint.sh` — startup validation + two-process supervision
 - `docker-compose.yml` — optional local test
 - `.env.example` — optional environment overrides
+- `CHANGELOG.md` — record of maintenance changes to this project

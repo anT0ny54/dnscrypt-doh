@@ -3,8 +3,11 @@
 # for a 512 MB / 0.25 vCPU public DoH gateway.
 ##############################################
 
-# Local DNS listener used only by the Go DoH gateway.
-listen_addresses = ['127.0.0.1:5353']
+# The classic plain-DNS/DNSCrypt listener is intentionally disabled. The
+# Go gateway only ever talks to the [local_doh] listener below on
+# 127.0.0.1:8053; a second listener on 5353 had nothing bound to it and
+# was just an unused open loopback port.
+listen_addresses = []
 
 # Keep only the protocols we need.
 ipv4_servers = true
