@@ -53,6 +53,9 @@ path = '/dns-query'
 # Only these three HaGeZi resolvers are used. The stamps include the
 # resolver hostname and IPv4 address, avoiding dependence on a large
 # downloaded public-resolver list.
+
+server_names = ['HaGeZiDNS1', 'HaGeZiDNS2', 'HaGeZiDNS3']
+
 [static.'HaGeZiDNS1']
 stamp = 'sdns://AgMAAAAAAAAADjE4OC4zNC4xNjEuMjEwAA9yb290LmhhZ2V6aS5vcmcKL2Rucy1xdWVyeQ'
 
@@ -62,4 +65,3 @@ stamp = 'sdns://AgMAAAAAAAAADTE1OS42OS4xNTUuOTQAEHd1cnpuLmhhZ2V6aS5vcmcKL2Rucy1x
 [static.'HaGeZiDNS3']
 stamp = 'sdns://AgMAAAAAAAAADTk1LjIxNy4xNjMuMTcAEGp1dXJpLmhhZ2V6aS5vcmcKL2Rucy1xdWVyeQ'
 
-server_names = ['HaGeZiDNS1', 'HaGeZiDNS2', 'HaGeZiDNS3']
