@@ -1,3 +1,3 @@
-module github.com/example/minimal-hagezi-doh
+module github.com/anT0ny54/dnscrypt-doh
 
 go 1.23
