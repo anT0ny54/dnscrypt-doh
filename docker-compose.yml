@@ -1,0 +1,19 @@
+services:
+  doh:
+    build:
+      context: .
+      args:
+        TARGETARCH: amd64
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: 8080
+      GOMAXPROCS: 1
+      GOGC: 75
+      GOMEMLIMIT: 192MiB
+      RATE_LIMIT: 99
+      RATE_WINDOW_SECONDS: 60
+      MAX_CONCURRENCY: 128
+      MAX_CLIENT_IPS: 250000
+      TRUST_PROXY_HEADERS: "true"
+    restart: unless-stopped

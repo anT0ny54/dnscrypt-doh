@@ -1,0 +1,65 @@
+##############################################
+# Minimal dnscrypt-proxy 2.1.18 configuration
+# for a 512 MB / 0.25 vCPU public DoH gateway.
+##############################################
+
+# Local DNS listener used only by the Go DoH gateway.
+listen_addresses = ['127.0.0.1:5353']
+
+# Keep only the protocols we need.
+ipv4_servers = true
+ipv6_servers = false
+dnscrypt_servers = false
+doh_servers = true
+odoh_servers = false
+http3 = false
+http3_probe = false
+pqdnscrypt = false
+
+# Upstream transport / resolver selection.
+timeout = 5000
+keepalive = 30
+lb_strategy = 'p2'
+lb_estimator = true
+
+# Small, useful in-memory cache. This reduces duplicate upstream work
+# without making cache memory dominate a 512 MB container.
+cache = true
+cache_size = 32768
+cache_min_ttl = 30
+cache_max_ttl = 86400
+cache_neg_min_ttl = 15
+cache_neg_max_ttl = 300
+
+# Defensive defaults.
+max_clients = 256
+block_unqualified = true
+block_undelegated = true
+ignore_system_dns = true
+bootstrap_resolvers = ['9.9.9.11:53', '1.1.1.1:53']
+netprobe_timeout = 10
+netprobe_address = '9.9.9.9:53'
+
+# Do not write query logs in this minimal public service.
+log_level = 2
+log_file = '/dev/stdout'
+log_file_latest = true
+
+# Local HTTP DoH server. TLS is terminated by SnapDeploy's managed edge.
+[local_doh]
+listen_addresses = ['127.0.0.1:8053']
+path = '/dns-query'
+
+# Only these three HaGeZi resolvers are used. The stamps include the
+# resolver hostname and IPv4 address, avoiding dependence on a large
+# downloaded public-resolver list.
+[static.'HaGeZiDNS1']
+stamp = 'sdns://AgMAAAAAAAAADjE4OC4zNC4xNjEuMjEwAA9yb290LmhhZ2V6aS5vcmcKL2Rucy1xdWVyeQ'
+
+[static.'HaGeZiDNS2']
+stamp = 'sdns://AgMAAAAAAAAADTE1OS42OS4xNTUuOTQAEHd1cnpuLmhhZ2V6aS5vcmcKL2Rucy1xdWVyeQ'
+
+[static.'HaGeZiDNS3']
+stamp = 'sdns://AgMAAAAAAAAADTk1LjIxNy4xNjMuMTcAEGp1dXJpLmhhZ2V6aS5vcmcKL2Rucy1xdWVyeQ'
+
+server_names = ['HaGeZiDNS1', 'HaGeZiDNS2', 'HaGeZiDNS3']
