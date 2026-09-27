@@ -1,4 +1,4 @@
-# Minimal HaGeZi DoH for SnapDeploy (512 MB / 0.25 vCPU)
+# dnscrypt-proxy 2 + DoH gateway for SnapDeploy
 
 A compact public DNS-over-HTTPS service designed for SnapDeploy's Small container size.
 
@@ -125,4 +125,33 @@ The build verifies the SHA-256 checksum of the downloaded Go toolchain for amd64
 - `entrypoint.sh` — startup validation + two-process supervision
 - `docker-compose.yml` — optional local test
 - `.env.example` — optional environment overrides
-- `CHANGELOG.md` — record of maintenance changes to this project
+
+## 🌐 Free DNS Services
+
+High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
+
+| Blocklist | DNS-over-HTTPS (DoH) |
+| :--- | :--- |
+| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+
+## ⚡ Bandwidth Hero Server
+
+A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
+
+Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
+
+🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
+
+## Supporting the Project
+
+If you find this project useful, donations are appreciated:
+
+- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
+
+## License
+
+See [`LICENSE`](LICENSE).
