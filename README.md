@@ -94,11 +94,6 @@ The defaults are intentionally conservative for the Small instance:
 - HTTP connection reuse is enabled between the Go gateway and the local dnscrypt-proxy DoH listener.
 - Advertised request/response `Content-Length` values above the configured DNS message limit are rejected before body processing.
 
-There is no safe universal "maximum users" number for a 0.25-vCPU public DNS service: the practical ceiling depends mainly on query rate, cache hit rate, client RTT, and how much work the upstream resolvers must perform. The configuration therefore protects the task with hard bounded memory and concurrency instead of pretending that a specific user count can be guaranteed. The gateway always forwards DNS wire data only to the localhost dnscrypt-proxy DoH listener; there is no `DOH_UPSTREAM` override.
-
-## DNS response validation
-
-The gateway accepts RFC 8484-style `application/dns-message` GET/POST requests, validates the DNS wire format, requires exactly one DNS question, bounds the number of resource records checked per message, converts GET requests to a bounded POST on the local dnscrypt-proxy listener, and validates the returned DNS message before sending it to the client. Upstream responses must also use the `application/dns-message` media type, must remain within the configured message-size limit, and must preserve the DNS transaction ID. Oversized or malformed upstream responses become HTTP 502 instead of being passed through as arbitrary content.
 
 ## Important proxy-IP note
 
