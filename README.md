@@ -18,7 +18,7 @@ Up to 99 `/dns-query` requests per fixed 60-second window per client IP. Malform
 
 The gateway also applies global concurrency backpressure (default 128 simultaneous DoH requests) so an unusual burst cannot consume all 0.25 vCPU capacity. When the concurrency ceiling is reached, new requests receive HTTP 503 rather than queueing indefinitely. Malformed requests are rejected before they consume a concurrency slot.
 
-The IP limiter stores up to 250,000 client identities with 64 shards and periodic cleanup. Entries are stored directly as small map values to avoid a per-client heap allocation. This is deliberately bounded so a public endpoint cannot grow its in-memory IP table without limit.
+The IP limiter stores client identities in 64 shards with periodic cleanup. Entries are stored directly as small map values to avoid a per-client heap allocation, and each shard fails closed when full instead of scanning on the request path. Shard maps are allocated lazily so an unused `MAX_CLIENT_IPS` table does not pre-reserve map buckets across all shards. Per-shard capacity is rounded up, so the configured `MAX_CLIENT_IPS` is always fully usable (aggregate capacity can exceed it by at most 63 entries).
 
 ## Why this layout
 
@@ -40,7 +40,7 @@ Go DoH gateway
   - 128 request concurrency ceiling
   - bounded request size + DNS validation
         |
-        | HTTP localhost :8053
+        | HTTPS localhost :8053
         v
  dnscrypt-proxy 2.1.5
   - small in-memory cache
@@ -48,12 +48,16 @@ Go DoH gateway
   - 3 pinned HaGeZi DoH upstreams
 ```
 
+The container runs [tini](https://github.com/krallin/tini) as PID 1 so terminated child processes are reaped, signal forwarding is reliable, and the entrypoint's supervision loop can trust `kill -0` liveness checks.
+
 ## SnapDeploy deployment
 
 1. Push this directory to GitHub.
 2. In SnapDeploy, deploy the repository and keep the Small container size (512 MB / 0.25 vCPU).
 3. No required secrets are needed. SnapDeploy manages `PORT` automatically.
-4. After deployment, the public DoH endpoint is:
+4. Set `TRUST_PROXY_HEADERS=true` in the app environment so per-client rate limiting uses the client IP provided by SnapDeploy's managed edge instead of the edge's own address. Leave it `false` anywhere else unless your edge overwrites those headers.
+5. `DOH_PATH` may be customized but cannot be `/` or `/health` (those endpoints are reserved); the gateway refuses to start with a colliding path.
+6. After deployment, the public DoH endpoint is:
 
 ```text
 https://YOUR-APP.containers.snapdeploy.app/dns-query
@@ -66,6 +70,8 @@ or your configured custom domain on an Always-On container.
 ```text
 GET /health
 ```
+
+The health endpoint is readiness-aware: it returns `503 {"status":"starting"}` until the gateway can establish a TCP connection to the dnscrypt-proxy DoH listener, and `200 {"status":"ok"}` afterwards. The Dockerfile `HEALTHCHECK` and SnapDeploy's health check both observe this, so traffic is not routed to a container whose upstream is not yet listening.
 
 ### Simple test
 
@@ -90,18 +96,21 @@ The defaults are intentionally conservative for the Small instance:
 - `dnscrypt-proxy` uses an in-memory cache of 32,768 entries to absorb repeated queries without a separate database.
 - `max_clients=256` applies only to the localhost DNS client side; the public IP limiter is separate.
 - The gateway buffers and validates each DNS request/response within `MAX_DNS_MESSAGE_BYTES` before forwarding or responding.
-- Full rate-limit shards fail closed without scanning the whole shard on every new client attempt; periodic cleanup removes expired identities. Shard maps are allocated lazily so an unused `MAX_CLIENT_IPS=250000` table does not pre-reserve map buckets across all 64 shards.
+- Full rate-limit shards fail closed without scanning the whole shard on every new client attempt; periodic cleanup removes expired identities. Shard maps are allocated lazily so an unused `MAX_CLIENT_IPS=256` table does not pre-reserve map buckets across all 64 shards, and per-shard capacity is rounded up so the configured limit is never silently under-provisioned.
+- The HTTP transport connection ceilings (`MaxConnsPerHost`, `MaxIdleConnsPerHost`) are tied to `MAX_CONCURRENCY`, so the advertised concurrency limit is not silently capped lower by the transport.
+- The upstream deadline is owned by a single per-request context timeout (`6s`); it is not duplicated in `http.Client.Timeout` or `ResponseHeaderTimeout`, keeping timeout behavior predictable.
 - HTTP connection reuse is enabled between the Go gateway and the local dnscrypt-proxy DoH listener.
 - Advertised request/response `Content-Length` values above the configured DNS message limit are rejected before body processing.
 
-
 ## Important proxy-IP note
 
-By default the gateway trusts `CF-Connecting-IP` and the first `X-Forwarded-For` address because SnapDeploy documents its managed edge as Cloudflare/Caddy in front of the Fargate task. If you deploy this image somewhere that does not sanitize those headers before forwarding requests, set:
+The gateway defaults to `TRUST_PROXY_HEADERS=false`. It only trusts `CF-Connecting-IP` and the first `X-Forwarded-For` address when explicitly enabled, because trusting unsanitized forwarding headers lets clients spoof their IP and bypass per-client rate limits. Enable it only when the edge in front of the container overwrites those headers with the true client IP:
 
 ```text
-TRUST_PROXY_HEADERS=false
+TRUST_PROXY_HEADERS=true
 ```
+
+Do this for SnapDeploy's managed edge; do not do it on a network where clients can set those headers themselves.
 
 ## Build-time version pins
 
@@ -109,15 +118,15 @@ TRUST_PROXY_HEADERS=false
 - Go compiler: `1.23.2`
 - dnscrypt-proxy: `2.1.5`
 
-The build verifies the SHA-256 checksum of the downloaded Go toolchain for amd64/arm64. dnscrypt-proxy is built from the tagged 2.1.5 source with vendored dependencies.
+The build verifies the SHA-256 checksum of the downloaded Go toolchain for amd64/arm64 and of the dnscrypt-proxy 2.1.5 source tarball. dnscrypt-proxy is built from the tagged 2.1.5 source with vendored dependencies.
 
 ## Files
 
-- `Dockerfile` — multi-stage, minimal runtime image
-- `main.go` — DoH gateway, DNS wire validation, and bounded per-IP limiter
+- `Dockerfile` — multi-stage, minimal runtime image (tini as PID 1, checksum-verified downloads)
+- `main.go` — DoH gateway, DNS wire validation, readiness-aware health endpoint, and bounded per-IP limiter
 - `main_test.go` — gateway and DNS validation regression tests
 - `dnscrypt-proxy.toml` — pinned HaGeZi resolver stamps + local DoH listener
-- `entrypoint.sh` — startup validation + two-process supervision
+- `entrypoint.sh` — startup validation + two-process supervision under tini
 - `docker-compose.yml` — optional local test
 - `.env.example` — optional environment overrides
 

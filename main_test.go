@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -47,6 +48,29 @@ func queryWithQName(id byte, qname []byte) []byte {
 	return body
 }
 
+// queryWithAdditional builds a one-question query whose additional section
+// holds a single record of the given type (OPT/41 is the only valid choice).
+func queryWithAdditional(id byte, rtype uint16) []byte {
+	body := []byte{
+		0x12, id, 0x01, 0x00, // ID, standard query flags
+		0x00, 0x01, // QDCOUNT = 1
+		0x00, 0x00, // ANCOUNT = 0
+		0x00, 0x00, // NSCOUNT = 0
+		0x00, 0x01, // ARCOUNT = 1
+		0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00,
+		0x00, 0x01, // QTYPE = A
+		0x00, 0x01, // QCLASS = IN
+		// Additional record: root owner name, given type, class 4096 (UDP
+		// payload size for OPT), zero TTL, empty RDATA.
+		0x00,
+		byte(rtype >> 8), byte(rtype),
+		0x10, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00,
+	}
+	return body
+}
+
 type trackingBody struct {
 	read bool
 }
@@ -77,7 +101,7 @@ func newTestGateway(upstream string) *server {
 		},
 		upstream:   u,
 		dohPath:    defaultDoHPath,
-		rate:       newRateLimiter(99, 60, 250000),
+		rate:       newRateLimiter(99, 60, 256),
 		sem:        make(chan struct{}, 2),
 		maxBody:    defaultMaxBodyBytes,
 		trustProxy: false,
@@ -115,6 +139,51 @@ func TestValidDNSMessageRejectsMultipleQuestions(t *testing.T) {
 	query[5] = 0x02
 	if validDNSMessage(query, false) {
 		t.Fatal("expected multiple questions to be rejected")
+	}
+}
+
+func TestValidDNSMessageRejectsAnswerRecordsInQuery(t *testing.T) {
+	query := testQuery(20)
+	query[6] = 0x00
+	query[7] = 0x01 // ANCOUNT = 1 must never appear in a query
+	if validDNSMessage(query, false) {
+		t.Fatal("expected query with answer records to be rejected")
+	}
+}
+
+func TestValidDNSMessageRejectsAuthorityRecordsInQuery(t *testing.T) {
+	query := testQuery(21)
+	query[8] = 0x00
+	query[9] = 0x01 // NSCOUNT = 1 must never appear in a query
+	if validDNSMessage(query, false) {
+		t.Fatal("expected query with authority records to be rejected")
+	}
+}
+
+func TestValidDNSMessageAcceptsOPTAdditionalInQuery(t *testing.T) {
+	query := queryWithAdditional(22, dnsTypeOPT)
+	if !validDNSMessage(query, false) {
+		t.Fatal("expected query with EDNS OPT additional record to validate")
+	}
+}
+
+func TestValidDNSMessageRejectsNonOPTAdditionalInQuery(t *testing.T) {
+	query := queryWithAdditional(23, 1) // A record in the additional section
+	if validDNSMessage(query, false) {
+		t.Fatal("expected query with non-OPT additional record to be rejected")
+	}
+}
+
+func TestValidateDoHPath(t *testing.T) {
+	for _, ok := range []string{"/dns-query", "/doh", "/a/b"} {
+		if err := validateDoHPath(ok); err != nil {
+			t.Fatalf("validateDoHPath(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "dns-query", "/", "/health"} {
+		if err := validateDoHPath(bad); err == nil {
+			t.Fatalf("validateDoHPath(%q) = nil, want error", bad)
+		}
 	}
 }
 
@@ -167,7 +236,7 @@ func TestDoHRejectsAdvertisedOversizedPOST(t *testing.T) {
 }
 
 func TestRateLimiterAllocatesShardMapsLazily(t *testing.T) {
-	r := newRateLimiter(1, 60, 250000)
+	r := newRateLimiter(1, 60, 256)
 	for i := range r.shards {
 		if r.shards[i].m != nil {
 			t.Fatalf("shard %d map allocated before first request", i)
@@ -186,6 +255,16 @@ func TestRateLimiterAllocatesShardMapsLazily(t *testing.T) {
 	}
 	if used != 1 {
 		t.Fatalf("allocated shard maps = %d, want 1", used)
+	}
+}
+
+func TestRateLimiterRoundsUpShardCapacity(t *testing.T) {
+	r := newRateLimiter(1, 60, 65)
+	if got, want := r.maxEntriesPerShard, 2; got != want {
+		t.Fatalf("maxEntriesPerShard = %d, want %d (65 entries across 64 shards rounds up)", got, want)
+	}
+	if got, want := r.maxEntriesPerShard*shardCount, 128; got != want {
+		t.Fatalf("aggregate capacity = %d, want %d", got, want)
 	}
 }
 
@@ -447,6 +526,28 @@ func TestDoHRejectsMismatchedResponseID(t *testing.T) {
 	}
 }
 
+func TestDoHRejectsMismatchedResponseQuestion(t *testing.T) {
+	query := testQuery(16)
+	response := testResponse(query)
+	// Corrupt the response question: flip a byte inside the QNAME. The message
+	// is still well-formed DNS, but it no longer answers the asked question.
+	response[17] = 'x'
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(response)
+	}))
+	defer upstream.Close()
+
+	s := newTestGateway(upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader(string(query)))
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+}
+
 func TestDoHRejectsUnsupportedMethod(t *testing.T) {
 	s := newTestGateway("http://127.0.0.1:9/dns-query")
 	req := httptest.NewRequest(http.MethodPut, defaultDoHPath, strings.NewReader("ignored"))
@@ -560,5 +661,57 @@ func TestDoHRejectsUpstreamRedirect(t *testing.T) {
 	s.doh(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+}
+
+func TestHealthReportsUpstreamReadiness(t *testing.T) {
+	// Upstream accepting connections: health is OK.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	s := newTestGateway("https://" + ln.Addr().String() + "/dns-query")
+	rec := httptest.NewRecorder()
+	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Upstream refusing connections: health reports 503 starting state.
+	s = newTestGateway("http://127.0.0.1:1/dns-query")
+	rec = httptest.NewRecorder()
+	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
+
+func TestDNSQuestionSection(t *testing.T) {
+	query := testQuery(17)
+	section, ok := dnsQuestionSection(query)
+	if !ok {
+		t.Fatal("expected question section from valid query")
+	}
+	// QNAME example.com + QTYPE A + QCLASS IN = 13 + 2 + 2 bytes.
+	if want := 17; len(section) != want {
+		t.Fatalf("question section length = %d, want %d", len(section), want)
+	}
+	if !bytes.Equal(section, query[12:]) {
+		t.Fatal("question section should extend to the end of a bare query")
+	}
+	truncated := query[:len(query)-2]
+	if _, ok := dnsQuestionSection(truncated); ok {
+		t.Fatal("expected truncated question to be rejected")
 	}
 }
