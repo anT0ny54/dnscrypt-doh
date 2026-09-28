@@ -1,5 +1,5 @@
 ##############################################
-# Minimal dnscrypt-proxy 2.1.5 configuration
+# Minimal dnscrypt-proxy 2.1.18 configuration
 # for a 512 MB / 0.25 vCPU public DoH gateway.
 ##############################################
 

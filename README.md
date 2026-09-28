@@ -16,7 +16,7 @@ The configuration pins these three DoH resolvers with their published DNS stamps
 
 Up to 99 `/dns-query` requests per fixed 60-second window per client IP. Malformed attempts also consume quota; `/health` and `/` are not rate-limited.
 
-The gateway also applies global concurrency backpressure (default 128 simultaneous DoH requests) so an unusual burst cannot consume all 0.25 vCPU capacity. When the concurrency ceiling is reached, new requests receive HTTP 503 rather than queueing indefinitely. Malformed requests are rejected before they consume a concurrency slot.
+The gateway also applies global concurrency backpressure (default 8 simultaneous DoH requests) so an unusual burst cannot consume all 0.25 vCPU capacity. When the concurrency ceiling is reached, new requests receive HTTP 503 rather than queueing indefinitely. Malformed requests are rejected before they consume a concurrency slot.
 
 The IP limiter stores client identities in 64 shards with periodic cleanup. Entries are stored directly as small map values to avoid a per-client heap allocation, and each shard fails closed when full instead of scanning on the request path. Shard maps are allocated lazily so an unused `MAX_CLIENT_IPS` table does not pre-reserve map buckets across all shards. Per-shard capacity is rounded up, so the configured `MAX_CLIENT_IPS` is always fully usable (aggregate capacity can exceed it by at most 63 entries).
 
@@ -37,12 +37,12 @@ SnapDeploy managed edge / TLS
         v
 Go DoH gateway
   - per-IP 99/60s limiter
-  - 128 request concurrency ceiling
+  - 8 request concurrency ceiling (raise to 12, then 16 only after load testing)
   - bounded request size + DNS validation
         |
         | HTTPS localhost :8053
         v
- dnscrypt-proxy 2.1.5
+ dnscrypt-proxy 2.1.18
   - small in-memory cache
   - p2 load balancing
   - 3 pinned HaGeZi DoH upstreams
@@ -88,6 +88,9 @@ curl -sS -H 'accept: application/dns-message' \
 
 ## Performance knobs
 
+The image pins the build/runtime components rather than accepting an independently overridable dnscrypt-proxy version/checksum pair. This keeps the checksum verification bound to the exact source version used by the build.
+
+
 The defaults are intentionally conservative for the Small instance:
 
 - `GOMAXPROCS=1` prevents the Go runtime from overscheduling a 0.25-vCPU task.
@@ -95,8 +98,11 @@ The defaults are intentionally conservative for the Small instance:
 - `GOMEMLIMIT=192MiB` bounds the Go gateway heap independently of the container limit while keeping the gateway well inside the 512 MB task budget.
 - `dnscrypt-proxy` uses an in-memory cache of 32,768 entries to absorb repeated queries without a separate database.
 - `max_clients=256` applies only to the localhost DNS client side; the public IP limiter is separate.
+- The public IP limiter defaults to `MAX_CLIENT_IPS=10000`, enough for many distinct client IPs without allowing unbounded identity churn on a 0.25-vCPU instance.
+- `MAX_CONCURRENCY=8` is the baseline for 0.25 vCPU. Increase to 12 and then 16 only after load testing; higher values can increase CPU contention and health-check failures.
+- `MAX_DNS_MESSAGE_BYTES=4096` is the default. Raise it to 8192 only when client compatibility requires larger DNS messages.
 - The gateway buffers and validates each DNS request/response within `MAX_DNS_MESSAGE_BYTES` before forwarding or responding.
-- Full rate-limit shards fail closed without scanning the whole shard on every new client attempt; periodic cleanup removes expired identities. Shard maps are allocated lazily so an unused `MAX_CLIENT_IPS=256` table does not pre-reserve map buckets across all 64 shards, and per-shard capacity is rounded up so the configured limit is never silently under-provisioned.
+- Full rate-limit shards fail closed without scanning the whole shard on every new client attempt; periodic cleanup removes expired identities. Shard maps are allocated lazily so an unused `MAX_CLIENT_IPS` table does not pre-reserve map buckets across all 64 shards, and per-shard capacity is rounded up so the configured limit is never silently under-provisioned.
 - The HTTP transport connection ceilings (`MaxConnsPerHost`, `MaxIdleConnsPerHost`) are tied to `MAX_CONCURRENCY`, so the advertised concurrency limit is not silently capped lower by the transport.
 - The upstream deadline is owned by a single per-request context timeout (`6s`); it is not duplicated in `http.Client.Timeout` or `ResponseHeaderTimeout`, keeping timeout behavior predictable.
 - HTTP connection reuse is enabled between the Go gateway and the local dnscrypt-proxy DoH listener.
@@ -114,11 +120,11 @@ Do this for SnapDeploy's managed edge; do not do it on a network where clients c
 
 ## Build-time version pins
 
-- Alpine runtime/build image: `3.24.1`
-- Go compiler: `1.23.2`
-- dnscrypt-proxy: `2.1.5`
+- Alpine runtime/build image: `3.24.2`
+- Go compiler: `1.27.1`
+- dnscrypt-proxy: `2.1.18`
 
-The build verifies the SHA-256 checksum of the downloaded Go toolchain for amd64/arm64 and of the dnscrypt-proxy 2.1.5 source tarball. dnscrypt-proxy is built from the tagged 2.1.5 source with vendored dependencies.
+The build verifies the SHA-256 checksum of the downloaded Go toolchain for amd64/arm64 and of the dnscrypt-proxy 2.1.18 source tarball. dnscrypt-proxy is built from the fixed 2.1.18 source tag with vendored dependencies.
 
 ## Files
 

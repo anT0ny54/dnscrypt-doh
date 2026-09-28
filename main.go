@@ -30,9 +30,9 @@ const (
 	fixedUpstreamURL       = "https://127.0.0.1:8053/dns-query"
 	defaultRateLimit       = 99
 	defaultRateWindowSec   = 60
-	defaultMaxBodyBytes    = 65535
-	defaultConcurrency     = 128
-	defaultClientEntries   = 256
+	defaultMaxBodyBytes    = 4096
+	defaultConcurrency     = 8
+	defaultClientEntries   = 10000
 	defaultMaxHeaderBytes  = 16 << 10
 	defaultMaxGetQuerySize = 12 << 10
 	minMaxBodyBytes        = 512
