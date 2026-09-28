@@ -55,6 +55,8 @@ server_names = ['HaGeZiDNS1', 'HaGeZiDNS2', 'HaGeZiDNS3']
 [local_doh]
 listen_addresses = ['127.0.0.1:8053']
 path = '/dns-query'
+cert_file = '/etc/localhost.pem'
+cert_key_file = '/etc/localhost.pem'
 
 [static.'HaGeZiDNS1']
 stamp = 'sdns://AgMAAAAAAAAADjE4OC4zNC4xNjEuMjEwAA9yb290LmhhZ2V6aS5vcmcKL2Rucy1xdWVyeQ'
