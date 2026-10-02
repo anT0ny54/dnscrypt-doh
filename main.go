@@ -49,6 +49,7 @@ const (
 	upstreamProbeTimeout   = 500 * time.Millisecond
 	upstreamProbeCacheTTL  = 2 * time.Second
 	shutdownGrace          = 5 * time.Second
+	maxCleanupIntervalSec  = 30
 )
 
 type rateEntry struct {
@@ -126,7 +127,10 @@ func (r *rateLimiter) allow(ip netip.Addr) bool {
 		entry = rateEntry{window: nowWindow}
 	}
 	if sh.m == nil {
-		sh.m = make(map[netip.Addr]rateEntry, r.maxEntriesPerShard)
+		// No capacity hint: hinting maxEntriesPerShard would reserve buckets
+		// for the whole shard capacity on first use (tens of MB in total at
+		// MAX_CLIENT_IPS=1,000,000), defeating the lazy allocation.
+		sh.m = make(map[netip.Addr]rateEntry)
 	}
 
 	if entry.window != nowWindow {
@@ -139,6 +143,17 @@ func (r *rateLimiter) allow(ip netip.Addr) bool {
 	entry.count++
 	sh.m[ip] = entry
 	return true
+}
+
+// cleanupInterval bounds how long expired entries can occupy limiter slots.
+// Ticking only once per RATE_WINDOW_SECONDS let expired entries linger for up
+// to a whole extra window (a day at the 86,400 maximum), and because a full
+// shard fails closed, new clients could be refused during that time.
+func cleanupInterval(windowSec int) time.Duration {
+	if windowSec > maxCleanupIntervalSec {
+		windowSec = maxCleanupIntervalSec
+	}
+	return time.Duration(windowSec) * time.Second
 }
 
 func (r *rateLimiter) cleanup() {
@@ -207,7 +222,9 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 		if err != nil {
 			return netip.Addr{}
 		}
-		return ip.Unmap()
+		// Strip IPv6 zone identifiers so they cannot be used to mint
+		// additional rate-limit identities for the same address.
+		return ip.Unmap().WithZone("")
 	}
 
 	if trustProxy {
@@ -233,13 +250,6 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 	return parse(r.RemoteAddr)
 }
 
-// doHPath reports whether path is the configured DoH endpoint. dohPath is
-// guaranteed non-empty and non-reserved by getenv + validateDoHPath in main,
-// so no empty-configured fallback is needed here.
-func doHPath(path, configured string) bool {
-	return path == configured
-}
-
 // validateDoHPath rejects paths that would shadow the reserved /health and /
 // endpoints in the mux.
 func validateDoHPath(path string) error {
@@ -261,9 +271,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func isDNSMessageContentType(v string) bool {
-	if v == "" {
-		return false
-	}
 	return strings.EqualFold(strings.TrimSpace(strings.Split(v, ";")[0]), "application/dns-message")
 }
 
@@ -560,7 +567,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Do(uReq)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) {
 			writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "dns upstream timeout"})
 			return
 		}
@@ -585,6 +592,11 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, s.maxBody+1))
 	if err != nil {
+		// The per-request deadline also covers the body read.
+		if errors.Is(err, context.DeadlineExceeded) {
+			writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "dns upstream timeout"})
+			return
+		}
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
 		return
 	}
@@ -592,7 +604,8 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
 		return
 	}
-	if len(body) < 2 || len(query) < 2 || binary.BigEndian.Uint16(body[:2]) != binary.BigEndian.Uint16(query[:2]) {
+	// Both messages passed validDNSMessage, so each is at least 12 bytes.
+	if binary.BigEndian.Uint16(body[:2]) != binary.BigEndian.Uint16(query[:2]) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "DNS response ID mismatch"})
 		return
 	}
@@ -649,13 +662,11 @@ func main() {
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
 		},
-		MaxIdleConns:          concLimit,
-		MaxIdleConnsPerHost:   concLimit,
-		MaxConnsPerHost:       concLimit,
-		IdleConnTimeout:       30 * time.Second,
-		DisableCompression:    true,
-		ForceAttemptHTTP2:     false,
-		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:        concLimit,
+		MaxIdleConnsPerHost: concLimit,
+		MaxConnsPerHost:     concLimit,
+		IdleConnTimeout:     30 * time.Second,
+		DisableCompression:  true,
 	}
 
 	s := &server{
@@ -680,7 +691,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		t := time.NewTicker(time.Duration(rateWindow) * time.Second)
+		t := time.NewTicker(cleanupInterval(rateWindow))
 		defer t.Stop()
 		for {
 			select {
@@ -695,7 +706,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if doHPath(r.URL.Path, s.dohPath) {
+		if r.URL.Path == s.dohPath {
 			s.doh(w, r)
 			return
 		}

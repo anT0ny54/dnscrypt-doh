@@ -18,7 +18,7 @@ Up to 99 `/dns-query` requests per fixed 60-second window per client IP. Malform
 
 The gateway also applies global concurrency backpressure (default 8 simultaneous DoH requests) so an unusual burst cannot consume all 0.25 vCPU capacity. When the concurrency ceiling is reached, new requests receive HTTP 503 with `Retry-After: 1` rather than queueing indefinitely. Malformed requests are rejected before they consume a concurrency slot.
 
-The IP limiter stores client identities in 64 shards with periodic cleanup. Entries are stored directly as small map values to avoid a per-client heap allocation, and each shard fails closed when full instead of scanning on the request path. Shard maps are allocated lazily so an unused `MAX_CLIENT_IPS` table does not pre-reserve map buckets across all shards. Per-shard capacity is rounded up, so the configured `MAX_CLIENT_IPS` is always fully usable (aggregate capacity can exceed it by at most 63 entries).
+The IP limiter stores client identities in 64 shards. A background cleanup removes expired identities every `RATE_WINDOW_SECONDS`, but at most every 30 seconds, so expired entries cannot keep occupying slots (a full shard rejects new clients) for up to a whole extra window when a long window is configured. Entries are stored directly as small map values to avoid a per-client heap allocation, and each shard fails closed when full instead of scanning on the request path. Shard maps are allocated lazily so an unused `MAX_CLIENT_IPS` table does not pre-reserve map buckets across all shards. Per-shard capacity is rounded up, so the configured `MAX_CLIENT_IPS` is always fully usable (aggregate capacity can exceed it by at most 63 entries).
 
 ## Why this layout
 
@@ -59,16 +59,16 @@ All settings are environment variables. Out-of-range or unparsable values silent
 | Variable | Gateway default | Image default | Valid range / notes |
 |---|---|---|---|
 | `PORT` | `8080` | `8080` | Listen port (managed by SnapDeploy) |
-| `DOH_PATH` | `/dns-query` | `/dns-query` | Must start with `/`; cannot be `/` or `/health`; no `?`, `#`, `%` or whitespace; no empty, `.` or `..` segments. A single trailing `/` is allowed. Invalid paths abort startup |
+| `DOH_PATH` | `/dns-query` | `/dns-query` | Must start with `/` and must not be `/` or `/health` (reserved endpoints). Invalid paths abort startup |
 | `RATE_LIMIT` | `99` | `99` | 1-1,000,000 requests per window per client IP |
 | `RATE_WINDOW_SECONDS` | `60` | `60` | 1-86,400 |
 | `MAX_DNS_MESSAGE_BYTES` | `4096` | `4096` | 512-65,535 |
 | `MAX_CONCURRENCY` | `8` | `8` | 1-512 |
 | `MAX_CLIENT_IPS` | `10000` | `10000` | 64-1,000,000 |
 | `TRUST_PROXY_HEADERS` | `false` | **`true`** | `1/true/yes/on` or `0/false/no/off` |
-| `GOMAXPROCS`, `GOGC`, `GOMEMLIMIT` | Go runtime defaults | `1`, `75`, `192MiB` | Go runtime tuning |
+| `GOMAXPROCS`, `GOGC`, `GOMEMLIMIT` | Go runtime defaults | `1`, `75`, `192MiB` | Go runtime tuning. Set as container-wide `ENV`, so they apply to both the gateway and dnscrypt-proxy (each is a Go process with its own limit) |
 
-The Dockerfile bakes in the "Image default" column, so `.env.example` and `docker-compose.yml` only need to override values that differ. The path of the internal dnscrypt-proxy listener (`https://127.0.0.1:8053/dns-query`) is fixed in `main.go` and `dnscrypt-proxy.toml`; `DOH_PATH` only changes the public path.
+The Dockerfile bakes in the "Image default" column, so `docker-compose.yml` only needs to override values that differ (it sets `TRUST_PROXY_HEADERS` to `false`; see the proxy-IP note below). The path of the internal dnscrypt-proxy listener (`https://127.0.0.1:8053/dns-query`) is fixed in `main.go` and `dnscrypt-proxy.toml`; `DOH_PATH` only changes the public path.
 
 ## SnapDeploy deployment
 
@@ -76,7 +76,7 @@ The Dockerfile bakes in the "Image default" column, so `.env.example` and `docke
 2. In SnapDeploy, deploy the repository and keep the Small container size (512 MB / 0.25 vCPU).
 3. No required secrets are needed. SnapDeploy manages `PORT` automatically.
 4. `TRUST_PROXY_HEADERS=true` is already the Docker image default, so per-client rate limiting uses the client IP provided by SnapDeploy's managed edge instead of the edge's own address. Set it to `false` anywhere else unless your edge overwrites those headers (see the proxy-IP note below).
-5. `DOH_PATH` may be customized but cannot be `/` or `/health` (those endpoints are reserved) and must be a clean path (see Configuration); the gateway refuses to start with an invalid path.
+5. `DOH_PATH` may be customized but must start with `/` and cannot be `/` or `/health` (those endpoints are reserved); the gateway refuses to start with an invalid path. Note that `?` and `#` never reach the server as part of a path (they are query/fragment separators), so a configured path containing them would simply never match a request.
 6. After deployment, the public DoH endpoint is:
 
 ```text
@@ -100,7 +100,7 @@ The health endpoint is readiness-aware. It returns `503 {"status":"starting"}` u
 - `POST` requires `Content-Type: application/dns-message` and a request body of at most `MAX_DNS_MESSAGE_BYTES` (default 4096, allowed range 512-65535); violations return `415` / `413`.
 - `GET` carries the wire-format query in the `dns` query parameter, base64url-encoded without padding (RFC 8484). The encoded parameter is limited to 12288 characters (about 9216 decoded bytes, so this is the effective GET ceiling if `MAX_DNS_MESSAGE_BYTES` is raised above 9216; use POST for larger messages); violations return `414` / `413`.
 - Every request message is fully validated as DNS wire format before forwarding: exactly one question; no answer or authority records in a query; additional records in a query are limited to EDNS(0) OPT (type 41); names must be at most 255 bytes; compression pointers must point strictly backwards; and at most 4096 resource records per message. Invalid messages return `400` (and consume rate-limit quota).
-- Responses from the upstream must be valid DNS responses whose ID and question section exactly match the forwarded query; mismatches return `502`. Upstream failures return `502`; upstream timeouts return `504` (the per-request upstream deadline is 6s). Non-2xx upstream statuses (redirects are not followed), wrong content types and oversized messages are also rejected with `502`.
+- Responses from the upstream must be valid DNS responses whose ID and question section exactly match the forwarded query; mismatches return `502`. Upstream failures return `502`; upstream timeouts return `504` (the per-request upstream deadline is 6s and also covers reading the response body). Non-2xx upstream statuses (redirects are not followed), wrong content types and oversized messages are also rejected with `502`.
 - When the concurrency ceiling is reached the gateway returns `503` with `Retry-After: 1`.
 - Responses always carry `Cache-Control: no-store`; caching is left to dnscrypt-proxy's in-memory cache.
 - Rate-limited clients receive `429` with `Retry-After` set to the configured window length in seconds (`RATE_WINDOW_SECONDS`).
@@ -126,14 +126,14 @@ The defaults are intentionally conservative for the Small instance:
 
 - `GOMAXPROCS=1` prevents the Go runtime from overscheduling a 0.25-vCPU task.
 - `GOGC=75` reduces idle heap growth.
-- `GOMEMLIMIT=192MiB` bounds the Go gateway heap independently of the container limit while keeping the gateway well inside the 512 MB task budget.
+- `GOMEMLIMIT=192MiB` is a soft heap limit that applies to each Go process in the container (gateway and dnscrypt-proxy), independently of the container limit, keeping both well inside the 512 MB task budget.
 - `dnscrypt-proxy` uses an in-memory cache of 32,768 entries to absorb repeated queries without a separate database.
 - `max_clients=256` applies only to the localhost DNS client side; the public IP limiter is separate.
 - The public IP limiter defaults to `MAX_CLIENT_IPS=10000`, enough for many distinct client IPs without allowing unbounded identity churn on a 0.25-vCPU instance.
 - `MAX_CONCURRENCY=8` is the baseline for 0.25 vCPU. Increase to 12 and then 16 only after load testing; higher values can increase CPU contention and health-check failures.
 - `MAX_DNS_MESSAGE_BYTES=4096` is the default. Raise it to 8192 only when client compatibility requires larger DNS messages.
 - The gateway buffers and validates each DNS request/response within `MAX_DNS_MESSAGE_BYTES` before forwarding or responding.
-- Full rate-limit shards fail closed without scanning the whole shard on every new client attempt; periodic cleanup removes expired identities. Shard maps are allocated lazily so an unused `MAX_CLIENT_IPS` table does not pre-reserve map buckets across all 64 shards, and per-shard capacity is rounded up so the configured limit is never silently under-provisioned.
+- Full rate-limit shards fail closed without scanning the whole shard on every new client attempt; periodic cleanup (at most every 30s) removes expired identities. Shard maps are allocated lazily, on a shard's first client and without a capacity hint, so a large `MAX_CLIENT_IPS` does not pre-reserve map buckets across the 64 shards, and per-shard capacity is rounded up so the configured limit is never silently under-provisioned.
 - The HTTP transport connection ceilings (`MaxConnsPerHost`, `MaxIdleConnsPerHost`) are tied to `MAX_CONCURRENCY`, so the advertised concurrency limit is not silently capped lower by the transport.
 - The upstream deadline is owned by a single per-request context timeout (`6s`); it is not duplicated in `http.Client.Timeout` or `ResponseHeaderTimeout`, keeping timeout behavior predictable.
 - HTTP connection reuse is enabled between the Go gateway and the local dnscrypt-proxy DoH listener.
@@ -148,7 +148,7 @@ The gateway binary defaults to `TRUST_PROXY_HEADERS=false`, but the Docker image
 TRUST_PROXY_HEADERS=true
 ```
 
-This is correct for SnapDeploy's managed edge. Set `TRUST_PROXY_HEADERS=false` when the container port is reachable directly (for example the published `8080:8080` port in `docker-compose.yml`). IPv6 zone identifiers in these headers are stripped, so they cannot be used to mint extra rate-limit identities.
+This is correct for SnapDeploy's managed edge. Set `TRUST_PROXY_HEADERS=false` when the container port is reachable directly. The provided `docker-compose.yml` already does this for its published `8080:8080` port. IPv6 zone identifiers in these headers are stripped, so they cannot be used to mint extra rate-limit identities.
 
 ## Local build and run
 
@@ -156,7 +156,9 @@ This is correct for SnapDeploy's managed edge. Set `TRUST_PROXY_HEADERS=false` w
 docker compose up --build
 ```
 
-The multi-stage Dockerfile downloads and checksum-verifies pinned Go and dnscrypt-proxy sources, builds dnscrypt-proxy, runs `go test` and `go vet` on the gateway, and builds it. `TARGETARCH` (`amd64` or `arm64`) is filled in automatically by BuildKit. The listener is published on `http://localhost:8080` with `TRUST_PROXY_HEADERS=true` unless you override it (see Configuration).
+The multi-stage Dockerfile downloads and checksum-verifies pinned Go and dnscrypt-proxy sources, builds dnscrypt-proxy, runs `go test` and `go vet` on the gateway, and builds it. `TARGETARCH` (`amd64` or `arm64`) is filled in automatically by BuildKit. The listener is published on `http://localhost:8080`. `docker-compose.yml` sets `TRUST_PROXY_HEADERS=false` there (the image default is `true`, intended for SnapDeploy's edge); change it in the `environment:` block only if you put a trusted proxy in front.
+
+The runtime image keeps the binaries and config root-owned; only the generated `localhost.pem` is owned by the unprivileged `doh` user, which runs the container.
 
 ## Changelog
 

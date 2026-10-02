@@ -381,7 +381,7 @@ func TestDoHPostNormalizesUpstreamToPOST(t *testing.T) {
 	if got := rec.Header().Get("Content-Length"); got != "45" {
 		t.Fatalf("content length = %q, want 45", got)
 	}
-	if string(rec.Body.Bytes()) != string(response) {
+	if rec.Body.String() != string(response) {
 		t.Fatalf("response body mismatch")
 	}
 }
@@ -644,7 +644,8 @@ func TestDoHRejectsOversizedUpstreamResponse(t *testing.T) {
 func TestDoHRejectsUpstreamRedirect(t *testing.T) {
 	query := testQuery(9)
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("redirect target should never receive the DNS request")
+		// t.Fatal must not be called from a non-test goroutine.
+		t.Error("redirect target should never receive the DNS request")
 	}))
 	defer target.Close()
 
@@ -700,6 +701,17 @@ func TestHealthReportsUpstreamReadiness(t *testing.T) {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
+
+func TestParseClientIPStripsIPv6Zone(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+	r.RemoteAddr = "[fe80::1%eth0]:8080"
+	got := parseClientIP(r, false)
+	want := netip.MustParseAddr("fe80::1")
+	if got != want {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+}
+
 func TestDNSQuestionSection(t *testing.T) {
 	query := testQuery(17)
 	section, ok := dnsQuestionSection(query)
@@ -716,5 +728,30 @@ func TestDNSQuestionSection(t *testing.T) {
 	truncated := query[:len(query)-2]
 	if _, ok := dnsQuestionSection(truncated); ok {
 		t.Fatal("expected truncated question to be rejected")
+	}
+}
+
+func TestCleanupIntervalIsCapped(t *testing.T) {
+	if got, want := cleanupInterval(5), 5*time.Second; got != want {
+		t.Fatalf("cleanupInterval(5) = %s, want %s", got, want)
+	}
+	if got, want := cleanupInterval(maxRateWindowSec), time.Duration(maxCleanupIntervalSec)*time.Second; got != want {
+		t.Fatalf("cleanupInterval(%d) = %s, want %s", maxRateWindowSec, got, want)
+	}
+}
+
+func TestRateLimiterCleanupRemovesExpiredEntries(t *testing.T) {
+	r := newRateLimiter(5, 60, 64)
+	ip := netip.MustParseAddr("192.0.2.30")
+	if !r.allow(ip) {
+		t.Fatal("first request should be allowed")
+	}
+	sh := &r.shards[int(addrHash(ip)%shardCount)]
+	entry := sh.m[ip]
+	entry.window-- // pretend the entry belongs to the previous window
+	sh.m[ip] = entry
+	r.cleanup()
+	if got := len(sh.m); got != 0 {
+		t.Fatalf("expired entries left after cleanup = %d, want 0", got)
 	}
 }

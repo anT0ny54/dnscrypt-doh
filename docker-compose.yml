@@ -6,17 +6,14 @@ services:
       context: .
     ports:
       - "8080:8080"
-    # No environment overrides here: every value previously listed in this
-    # block (PORT, GOMAXPROCS, GOGC, GOMEMLIMIT, RATE_LIMIT,
-    # RATE_WINDOW_SECONDS, MAX_CONCURRENCY, MAX_CLIENT_IPS,
-    # TRUST_PROXY_HEADERS) just restated the image's own baked-in Dockerfile
-    # ENV defaults, so it changed nothing and only risked drifting out of
-    # sync with the Dockerfile over time. To actually override a default for
-    # local testing, uncomment and edit below. Note the image bakes in
-    # TRUST_PROXY_HEADERS=true (for SnapDeploy's edge); when the port is
-    # published directly, as here, set it to "false" or clients can spoof
-    # their IP via CF-Connecting-IP / X-Forwarded-For:
-    # environment:
+    # Only values that differ from the image's baked-in Dockerfile ENV
+    # defaults belong here, so nothing drifts out of sync with the Dockerfile.
+    # The image defaults TRUST_PROXY_HEADERS=true (for SnapDeploy's managed
+    # edge, which overwrites the client-IP headers). Here the port is published
+    # directly with no such edge, so trusting those headers would let any
+    # client spoof its IP via CF-Connecting-IP / X-Forwarded-For and bypass
+    # the per-IP rate limit; hence it is disabled for local runs.
+    environment:
+      TRUST_PROXY_HEADERS: "false"
     #   RATE_LIMIT: 20
-    #   TRUST_PROXY_HEADERS: "false"
     restart: unless-stopped
