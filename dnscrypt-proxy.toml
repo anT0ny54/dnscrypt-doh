@@ -51,7 +51,10 @@ log_file_latest = true
 # downloaded public-resolver list.
 server_names = ['HaGeZiDNS1', 'HaGeZiDNS2', 'HaGeZiDNS3']
 
-# Local HTTP DoH server. TLS is terminated by SnapDeploy's managed edge.
+# Loopback-only DoH listener for the Go gateway. It serves HTTPS with the
+# self-signed localhost certificate generated at image build time (the public
+# TLS certificate is handled by SnapDeploy's managed edge, in front of the
+# gateway). The path must match fixedUpstreamURL in main.go.
 [local_doh]
 listen_addresses = ['127.0.0.1:8053']
 path = '/dns-query'

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,7 +35,7 @@ const (
 	defaultConcurrency     = 8
 	defaultClientEntries   = 10000
 	defaultMaxHeaderBytes  = 16 << 10
-	defaultMaxGetQuerySize = 12 << 10
+	maxGetQueryParamLength = 12 << 10
 	minMaxBodyBytes        = 512
 	maxMaxBodyBytes        = 65535
 	maxRateLimit           = 1000000
@@ -47,7 +48,9 @@ const (
 	shardCount             = 64
 	upstreamTimeout        = 6 * time.Second
 	upstreamProbeTimeout   = 500 * time.Millisecond
+	upstreamProbeCacheTTL  = 2 * time.Second
 	shutdownGrace          = 5 * time.Second
+	serviceName            = "minimal-hagezi-doh"
 )
 
 type rateEntry struct {
@@ -163,6 +166,12 @@ type server struct {
 	maxBody    int64
 	trustProxy bool
 	started    time.Time
+
+	// Cached upstream probe result so health checks do not perform a fresh
+	// TCP+TLS handshake on every call.
+	probeMu sync.Mutex
+	probeAt time.Time
+	probeOK bool
 }
 
 func getenv(key, fallback string) string {
@@ -200,7 +209,10 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 		if err != nil {
 			return netip.Addr{}
 		}
-		return ip.Unmap()
+		// Drop any IPv6 zone: "fe80::1%a" and "fe80::1%b" are distinct netip.Addr
+		// map keys, so a spoofable header could otherwise mint unlimited
+		// rate-limit identities for the same address.
+		return ip.WithZone("").Unmap()
 	}
 
 	if trustProxy {
@@ -226,22 +238,22 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 	return parse(r.RemoteAddr)
 }
 
-func doHPath(path, configured string) bool {
-	if configured == "" {
-		return path == defaultDoHPath
-	}
-	return path == configured
-}
-
 // validateDoHPath rejects paths that would shadow the reserved /health and /
-// endpoints in the mux.
-func validateDoHPath(path string) error {
-	if !strings.HasPrefix(path, "/") {
-		return fmt.Errorf("DOH_PATH must start with '/': %q", path)
+// endpoints, or that http.ServeMux would never deliver to the handler
+// (non-canonical paths are redirected, and r.URL.Path is already decoded).
+func validateDoHPath(p string) error {
+	if !strings.HasPrefix(p, "/") {
+		return fmt.Errorf("DOH_PATH must start with '/': %q", p)
 	}
-	switch path {
+	switch p {
 	case "/", "/health":
-		return fmt.Errorf("DOH_PATH %q conflicts with a reserved endpoint", path)
+		return fmt.Errorf("DOH_PATH %q conflicts with a reserved endpoint", p)
+	}
+	if strings.ContainsAny(p, "?#% \t\r\n") {
+		return fmt.Errorf("DOH_PATH must not contain '?', '#', '%%' or whitespace: %q", p)
+	}
+	if trimmed := strings.TrimSuffix(p, "/"); path.Clean(trimmed) != trimmed {
+		return fmt.Errorf("DOH_PATH must be a clean path (no empty, '.' or '..' segments): %q", p)
 	}
 	return nil
 }
@@ -413,7 +425,7 @@ func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int) {
 	if encoded == "" {
 		return nil, http.StatusBadRequest
 	}
-	if len(encoded) > defaultMaxGetQuerySize {
+	if len(encoded) > maxGetQueryParamLength {
 		return nil, http.StatusRequestURITooLong
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
@@ -429,11 +441,35 @@ func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int) {
 	return decoded, 0
 }
 
-// upstreamReady reports whether the fixed loopback DoH upstream accepts TCP
-// connections. It intentionally avoids doing a full DoH exchange so the health
-// endpoint stays cheap.
+// upstreamReady reports whether the fixed loopback DoH upstream accepts TLS
+// connections, caching the result briefly so health checks do not perform a
+// fresh TCP+TLS handshake on every call. It intentionally avoids doing a full
+// DoH exchange so the health endpoint stays cheap.
+//
+// The probe must complete a real TLS handshake before closing. A bare TCP
+// dial-and-close makes dnscrypt-proxy's local DoH server log a spurious
+// "http: TLS handshake error ... EOF" on every /health check, because Go's
+// net/http logs any connection that closes before the handshake finishes.
 func (s *server) upstreamReady() bool {
-	conn, err := net.DialTimeout("tcp", s.upstream.Host, upstreamProbeTimeout)
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if time.Since(s.probeAt) < upstreamProbeCacheTTL {
+		return s.probeOK
+	}
+	ok := s.probeUpstream()
+	s.probeAt = time.Now()
+	s.probeOK = ok
+	return ok
+}
+
+func (s *server) probeUpstream() bool {
+	d := &net.Dialer{Timeout: upstreamProbeTimeout}
+	conn, err := tls.DialWithDialer(d, "tcp", s.upstream.Host, &tls.Config{
+		// Loopback-only probe of the dnscrypt-proxy local_doh listener, which
+		// uses the container's bundled self-signed localhost certificate.
+		InsecureSkipVerify: true, //nolint:gosec
+		MinVersion:         tls.VersionTLS12,
+	})
 	if err != nil {
 		return false
 	}
@@ -450,14 +486,14 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if !s.upstreamReady() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"status":  "starting",
-			"service": "minimal-hagezi-doh",
+			"service": serviceName,
 			"uptime":  time.Since(s.started).Round(time.Second).String(),
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
-		"service": "minimal-hagezi-doh",
+		"service": serviceName,
 		"uptime":  time.Since(s.started).Round(time.Second).String(),
 	})
 }
@@ -469,17 +505,18 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service":   "minimal-hagezi-doh",
+		"service":   serviceName,
 		"endpoint":  s.dohPath,
 		"rateLimit": fmt.Sprintf("%d requests/%ds per client IP", s.rate.limit, s.rate.windowSec),
 	})
 }
 
+// doh handles requests for the configured DoH path only; the mux dispatches
+// exactly matching paths here and validateDoHPath keeps reserved paths free,
+// so no additional path check is needed inside the handler. Both the query
+// and the upstream response have already passed validDNSMessage (>= 12
+// bytes) by the time their IDs are compared.
 func (s *server) doh(w http.ResponseWriter, r *http.Request) {
-	if !doHPath(r.URL.Path, s.dohPath) {
-		http.NotFound(w, r)
-		return
-	}
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -562,7 +599,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
 		return
 	}
-	if len(body) < 2 || len(query) < 2 || binary.BigEndian.Uint16(body[:2]) != binary.BigEndian.Uint16(query[:2]) {
+	if binary.BigEndian.Uint16(body[:2]) != binary.BigEndian.Uint16(query[:2]) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "DNS response ID mismatch"})
 		return
 	}
@@ -590,7 +627,10 @@ func main() {
 	rateLimit := getenvInt("RATE_LIMIT", defaultRateLimit, 1, maxRateLimit)
 	rateWindow := getenvInt("RATE_WINDOW_SECONDS", defaultRateWindowSec, 1, maxRateWindowSec)
 	maxBody := getenvInt("MAX_DNS_MESSAGE_BYTES", defaultMaxBodyBytes, minMaxBodyBytes, maxMaxBodyBytes)
-	maxConcurrency := getenvInt("MAX_CONCURRENCY", defaultConcurrency, 1, maxConcurrency)
+	// concLimit, not maxConcurrency: the package-level const maxConcurrency is
+	// the env-var validation bound; shadowing it with the parsed local value
+	// was legal but made the two meanings easy to confuse.
+	concLimit := getenvInt("MAX_CONCURRENCY", defaultConcurrency, 1, maxConcurrency)
 	maxClients := getenvInt("MAX_CLIENT_IPS", defaultClientEntries, shardCount, maxClientEntries)
 	trustProxy := getenvBool("TRUST_PROXY_HEADERS", false)
 
@@ -616,9 +656,9 @@ func main() {
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
 		},
-		MaxIdleConns:          maxConcurrency,
-		MaxIdleConnsPerHost:   maxConcurrency,
-		MaxConnsPerHost:       maxConcurrency,
+		MaxIdleConns:          concLimit,
+		MaxIdleConnsPerHost:   concLimit,
+		MaxConnsPerHost:       concLimit,
 		IdleConnTimeout:       30 * time.Second,
 		DisableCompression:    true,
 		ForceAttemptHTTP2:     false,
@@ -637,7 +677,7 @@ func main() {
 		upstream:   upstream,
 		dohPath:    dohPath,
 		rate:       newRateLimiter(rateLimit, rateWindow, maxClients),
-		sem:        make(chan struct{}, maxConcurrency),
+		sem:        make(chan struct{}, concLimit),
 		maxBody:    int64(maxBody),
 		trustProxy: trustProxy,
 		started:    time.Now(),
@@ -662,7 +702,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if doHPath(r.URL.Path, s.dohPath) {
+		if r.URL.Path == s.dohPath {
 			s.doh(w, r)
 			return
 		}
@@ -685,8 +725,8 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("DoH gateway listening on 0.0.0.0:%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
-			port, dohPath, fixedUpstreamURL, rateLimit, rateWindow, maxClients, maxConcurrency, maxBody, trustProxy)
+		log.Printf("DoH gateway listening on :%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
+			port, dohPath, fixedUpstreamURL, rateLimit, rateWindow, maxClients, concLimit, maxBody, trustProxy)
 		errCh <- h.ListenAndServe()
 	}()
 

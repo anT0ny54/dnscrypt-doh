@@ -10,8 +10,8 @@ GATEWAY=/usr/local/bin/doh-gateway
 # tini runs as PID 1 and reaps terminated children, so the kill -0 liveness
 # checks in the supervision loop below are reliable (no zombie children).
 # Readiness is intentionally NOT gated here with a fixed sleep: the gateway's
-# /health endpoint reports 503 until the dnscrypt-proxy DoH listener accepts
-# TCP connections, which lets the container orchestrator observe real readiness
+# /health endpoint reports 503 until the dnscrypt-proxy DoH listener completes
+# a TLS handshake, which lets the container orchestrator observe real readiness
 # through its health check instead of racing a guessed startup delay.
 "$DNSCRYPT" -config "$CONFIG" &
 dns_pid=$!
@@ -19,14 +19,21 @@ dns_pid=$!
 "$GATEWAY" &
 gateway_pid=$!
 
+# Stop the gateway first and let it drain in-flight requests before taking the
+# upstream resolver away, then stop dnscrypt-proxy.
 cleanup() {
   trap - TERM INT HUP EXIT
-  kill "$gateway_pid" "$dns_pid" 2>/dev/null || true
+  kill "$gateway_pid" 2>/dev/null || true
   wait "$gateway_pid" 2>/dev/null || true
+  kill "$dns_pid" 2>/dev/null || true
   wait "$dns_pid" 2>/dev/null || true
 }
 
-trap cleanup TERM INT HUP EXIT
+# A trap handler that merely returns would resume the supervision loop below
+# (which would then misreport "stopped" and exit 1), so signals must exit
+# explicitly; the EXIT trap then performs the cleanup.
+trap 'exit 0' TERM INT HUP
+trap cleanup EXIT
 
 while :; do
   if ! kill -0 "$dns_pid" 2>/dev/null; then
@@ -37,5 +44,8 @@ while :; do
     echo "DoH gateway stopped; shutting down" >&2
     exit 1
   fi
-  sleep 2
+  # Background sleep + wait so a signal is handled immediately instead of after
+  # the foreground sleep finishes.
+  sleep 2 &
+  wait $!
 done

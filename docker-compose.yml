@@ -1,9 +1,9 @@
 services:
   doh:
+    # TARGETARCH is populated automatically by BuildKit from the build host /
+    # --platform; do not hard-code it here or arm64 hosts get an amd64 toolchain.
     build:
       context: .
-      args:
-        TARGETARCH: amd64
     ports:
       - "8080:8080"
     # No environment overrides here: every value previously listed in this
@@ -12,7 +12,11 @@ services:
     # TRUST_PROXY_HEADERS) just restated the image's own baked-in Dockerfile
     # ENV defaults, so it changed nothing and only risked drifting out of
     # sync with the Dockerfile over time. To actually override a default for
-    # local testing, uncomment and edit below:
+    # local testing, uncomment and edit below. Note the image bakes in
+    # TRUST_PROXY_HEADERS=true (for SnapDeploy's edge); when the port is
+    # published directly, as here, set it to "false" or clients can spoof
+    # their IP via CF-Connecting-IP / X-Forwarded-For:
     # environment:
     #   RATE_LIMIT: 20
+    #   TRUST_PROXY_HEADERS: "false"
     restart: unless-stopped
