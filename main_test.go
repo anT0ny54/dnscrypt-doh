@@ -98,6 +98,7 @@ func newTestGateway(upstream string) *server {
 				return http.ErrUseLastResponse
 			},
 		},
+		probe:      &http.Client{Transport: http.DefaultTransport},
 		upstream:   u,
 		dohPath:    defaultDoHPath,
 		rate:       newRateLimiter(99, 60, 256),
@@ -664,11 +665,12 @@ func TestDoHRejectsUpstreamRedirect(t *testing.T) {
 }
 
 func TestHealthReportsUpstreamReadiness(t *testing.T) {
-	// Upstream accepting a real TLS handshake: health is OK.
+	// Upstream answering HTTPS requests: health is OK.
 	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	upstream.StartTLS()
 
 	s := newTestGateway(upstream.URL + "/dns-query")
+	s.probe = upstream.Client() // trusts the test server's certificate
 	rec := httptest.NewRecorder()
 	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if rec.Code != http.StatusOK {
@@ -676,7 +678,7 @@ func TestHealthReportsUpstreamReadiness(t *testing.T) {
 	}
 
 	// A successful result is cached briefly, so a second health check does not
-	// need another handshake even if the upstream disappears immediately.
+	// need another request even if the upstream disappears immediately.
 	upstream.Close()
 	rec = httptest.NewRecorder()
 	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))

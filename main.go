@@ -47,7 +47,7 @@ const (
 	dnsTypeOPT             = 41
 	shardCount             = 64
 	upstreamTimeout        = 6 * time.Second
-	upstreamProbeTimeout   = 500 * time.Millisecond
+	upstreamProbeTimeout   = 1500 * time.Millisecond
 	upstreamProbeCacheTTL  = 2 * time.Second
 	shutdownGrace          = 5 * time.Second
 	serviceName            = "minimal-hagezi-doh"
@@ -158,7 +158,11 @@ func (r *rateLimiter) cleanup() {
 }
 
 type server struct {
-	client     *http.Client
+	client *http.Client
+	// probe is a dedicated single-connection client for /health. It is kept
+	// separate from client so a saturated request pool can never make the
+	// health check time out and report a healthy upstream as down.
+	probe      *http.Client
 	upstream   *url.URL
 	dohPath    string
 	rate       *rateLimiter
@@ -168,7 +172,7 @@ type server struct {
 	started    time.Time
 
 	// Cached upstream probe result so health checks do not perform a fresh
-	// TCP+TLS handshake on every call.
+	// request to the upstream on every call.
 	probeMu sync.Mutex
 	probeAt time.Time
 	probeOK bool
@@ -441,15 +445,18 @@ func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int) {
 	return decoded, 0
 }
 
-// upstreamReady reports whether the fixed loopback DoH upstream accepts TLS
-// connections, caching the result briefly so health checks do not perform a
-// fresh TCP+TLS handshake on every call. It intentionally avoids doing a full
-// DoH exchange so the health endpoint stays cheap.
+// upstreamReady reports whether the fixed loopback DoH upstream answers HTTPS
+// requests, caching the result briefly so health checks do not hit it on
+// every call. It intentionally avoids a full DoH exchange so the health
+// endpoint stays cheap.
 //
-// The probe must complete a real TLS handshake before closing. A bare TCP
-// dial-and-close makes dnscrypt-proxy's local DoH server log a spurious
-// "http: TLS handshake error ... EOF" on every /health check, because Go's
-// net/http logs any connection that closes before the handshake finishes.
+// The probe is a complete HTTP request over a kept-alive connection. A bare
+// TCP dial-and-close, or a TLS dial that is closed right after the handshake,
+// makes Go's net/http server in dnscrypt-proxy log
+// "http: TLS handshake error ... EOF" because the peer disappears before the
+// server has finished its side of the handshake. A real request never leaves
+// a half-finished handshake, and connection reuse means health checks rarely
+// open a new connection at all.
 func (s *server) upstreamReady() bool {
 	s.probeMu.Lock()
 	defer s.probeMu.Unlock()
@@ -462,18 +469,22 @@ func (s *server) upstreamReady() bool {
 	return ok
 }
 
+// probeUpstream treats any HTTP response (even 4xx for the missing dns
+// parameter) as proof that the listener is up and speaking TLS+HTTP.
 func (s *server) probeUpstream() bool {
-	d := &net.Dialer{Timeout: upstreamProbeTimeout}
-	conn, err := tls.DialWithDialer(d, "tcp", s.upstream.Host, &tls.Config{
-		// Loopback-only probe of the dnscrypt-proxy local_doh listener, which
-		// uses the container's bundled self-signed localhost certificate.
-		InsecureSkipVerify: true, //nolint:gosec
-		MinVersion:         tls.VersionTLS12,
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.upstream.String(), nil)
 	if err != nil {
 		return false
 	}
-	_ = conn.Close()
+	resp, err := s.probe.Do(req)
+	if err != nil {
+		return false
+	}
+	// Drain so the connection returns to the idle pool for the next probe.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
 	return true
 }
 
@@ -643,19 +654,23 @@ func main() {
 		log.Fatalf("invalid fixed DoH upstream: %v", err)
 	}
 
+	loopbackTLS := func() *tls.Config {
+		// dnscrypt-proxy's local DoH service uses its bundled localhost
+		// self-signed certificate. Used only for the fixed loopback upstream,
+		// never for public destinations.
+		return &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
+		}
+	}
+
 	// The upstream deadline is owned by the per-request context created in
 	// doh (upstreamTimeout). Do not also set http.Client.Timeout or
 	// ResponseHeaderTimeout here, or partial timeout behavior becomes hard to
 	// reason about.
 	transport := &http.Transport{
-		Proxy: nil,
-		TLSClientConfig: &tls.Config{
-			// dnscrypt-proxy's local DoH service uses its bundled localhost
-			// self-signed certificate. This transport is used only for the
-			// fixed loopback upstream, never for public destinations.
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
-		},
+		Proxy:                 nil,
+		TLSClientConfig:       loopbackTLS(),
 		MaxIdleConns:          concLimit,
 		MaxIdleConnsPerHost:   concLimit,
 		MaxConnsPerHost:       concLimit,
@@ -665,11 +680,29 @@ func main() {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	// Dedicated health-probe transport: one kept-alive connection, no redirects.
+	probeTransport := &http.Transport{
+		Proxy:               nil,
+		TLSClientConfig:     loopbackTLS(),
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		MaxConnsPerHost:     1,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+		ForceAttemptHTTP2:   false,
+	}
+
 	s := &server{
 		client: &http.Client{
 			Transport: transport,
 			// Do not follow redirects: the gateway must validate the actual
 			// upstream response status before forwarding anything to clients.
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		probe: &http.Client{
+			Transport: probeTransport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
