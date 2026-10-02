@@ -47,7 +47,6 @@ const (
 	shardCount             = 64
 	upstreamTimeout        = 6 * time.Second
 	upstreamProbeTimeout   = 500 * time.Millisecond
-	upstreamProbeCacheTTL  = 2 * time.Second
 	shutdownGrace          = 5 * time.Second
 )
 
@@ -164,12 +163,6 @@ type server struct {
 	maxBody    int64
 	trustProxy bool
 	started    time.Time
-
-	// Cached upstream probe result so health checks do not perform a fresh
-	// TCP+TLS handshake on every call.
-	probeMu sync.Mutex
-	probeAt time.Time
-	probeOK bool
 }
 
 func getenv(key, fallback string) string {
@@ -233,10 +226,10 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 	return parse(r.RemoteAddr)
 }
 
-// doHPath reports whether path is the configured DoH endpoint. dohPath is
-// guaranteed non-empty and non-reserved by getenv + validateDoHPath in main,
-// so no empty-configured fallback is needed here.
 func doHPath(path, configured string) bool {
+	if configured == "" {
+		return path == defaultDoHPath
+	}
 	return path == configured
 }
 
@@ -436,35 +429,11 @@ func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int) {
 	return decoded, 0
 }
 
-// upstreamReady reports whether the fixed loopback DoH upstream accepts TLS
-// connections, caching the result briefly so health checks do not perform a
-// fresh TCP+TLS handshake on every call. It intentionally avoids doing a full
-// DoH exchange so the health endpoint stays cheap.
-//
-// The probe must complete a real TLS handshake before closing. A bare TCP
-// dial-and-close makes dnscrypt-proxy's local DoH server log a spurious
-// "http: TLS handshake error ... EOF" on every /health check, because Go's
-// net/http logs any connection that closes before the handshake finishes.
+// upstreamReady reports whether the fixed loopback DoH upstream accepts TCP
+// connections. It intentionally avoids doing a full DoH exchange so the health
+// endpoint stays cheap.
 func (s *server) upstreamReady() bool {
-	s.probeMu.Lock()
-	defer s.probeMu.Unlock()
-	if time.Since(s.probeAt) < upstreamProbeCacheTTL {
-		return s.probeOK
-	}
-	ok := s.probeUpstream()
-	s.probeAt = time.Now()
-	s.probeOK = ok
-	return ok
-}
-
-func (s *server) probeUpstream() bool {
-	d := &net.Dialer{Timeout: upstreamProbeTimeout}
-	conn, err := tls.DialWithDialer(d, "tcp", s.upstream.Host, &tls.Config{
-		// Loopback-only probe of the dnscrypt-proxy local_doh listener, which
-		// uses the container's bundled self-signed localhost certificate.
-		InsecureSkipVerify: true, //nolint:gosec
-		MinVersion:         tls.VersionTLS12,
-	})
+	conn, err := net.DialTimeout("tcp", s.upstream.Host, upstreamProbeTimeout)
 	if err != nil {
 		return false
 	}
@@ -506,10 +475,11 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// doh handles requests for the configured DoH path only; the mux dispatches
-// exactly matching paths here and validateDoHPath keeps reserved paths free,
-// so no additional path check is needed inside the handler.
 func (s *server) doh(w http.ResponseWriter, r *http.Request) {
+	if !doHPath(r.URL.Path, s.dohPath) {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -620,10 +590,7 @@ func main() {
 	rateLimit := getenvInt("RATE_LIMIT", defaultRateLimit, 1, maxRateLimit)
 	rateWindow := getenvInt("RATE_WINDOW_SECONDS", defaultRateWindowSec, 1, maxRateWindowSec)
 	maxBody := getenvInt("MAX_DNS_MESSAGE_BYTES", defaultMaxBodyBytes, minMaxBodyBytes, maxMaxBodyBytes)
-	// concLimit, not maxConcurrency: the package-level const maxConcurrency is
-	// the env-var validation bound; shadowing it with the parsed local value
-	// was legal but made the two meanings easy to confuse.
-	concLimit := getenvInt("MAX_CONCURRENCY", defaultConcurrency, 1, maxConcurrency)
+	maxConcurrency := getenvInt("MAX_CONCURRENCY", defaultConcurrency, 1, maxConcurrency)
 	maxClients := getenvInt("MAX_CLIENT_IPS", defaultClientEntries, shardCount, maxClientEntries)
 	trustProxy := getenvBool("TRUST_PROXY_HEADERS", false)
 
@@ -649,9 +616,9 @@ func main() {
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
 		},
-		MaxIdleConns:          concLimit,
-		MaxIdleConnsPerHost:   concLimit,
-		MaxConnsPerHost:       concLimit,
+		MaxIdleConns:          maxConcurrency,
+		MaxIdleConnsPerHost:   maxConcurrency,
+		MaxConnsPerHost:       maxConcurrency,
 		IdleConnTimeout:       30 * time.Second,
 		DisableCompression:    true,
 		ForceAttemptHTTP2:     false,
@@ -670,7 +637,7 @@ func main() {
 		upstream:   upstream,
 		dohPath:    dohPath,
 		rate:       newRateLimiter(rateLimit, rateWindow, maxClients),
-		sem:        make(chan struct{}, concLimit),
+		sem:        make(chan struct{}, maxConcurrency),
 		maxBody:    int64(maxBody),
 		trustProxy: trustProxy,
 		started:    time.Now(),
@@ -719,7 +686,7 @@ func main() {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("DoH gateway listening on 0.0.0.0:%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
-			port, dohPath, fixedUpstreamURL, rateLimit, rateWindow, maxClients, concLimit, maxBody, trustProxy)
+			port, dohPath, fixedUpstreamURL, rateLimit, rateWindow, maxClients, maxConcurrency, maxBody, trustProxy)
 		errCh <- h.ListenAndServe()
 	}()
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -664,32 +665,27 @@ func TestDoHRejectsUpstreamRedirect(t *testing.T) {
 }
 
 func TestHealthReportsUpstreamReadiness(t *testing.T) {
-	// Upstream accepting a real TLS handshake: health is OK.
-	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	upstream.StartTLS()
+	// Upstream accepting connections: health is OK.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
 
-	s := newTestGateway(upstream.URL + "/dns-query")
+	s := newTestGateway("https://" + ln.Addr().String() + "/dns-query")
 	rec := httptest.NewRecorder()
 	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-
-	// A successful result is cached briefly, so a second health check does not
-	// need another handshake even if the upstream disappears immediately.
-	upstream.Close()
-	rec = httptest.NewRecorder()
-	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("cached status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-
-	// Once the cache expires, the next check probes again and reports failure.
-	s.probeAt = time.Now().Add(-upstreamProbeCacheTTL)
-	rec = httptest.NewRecorder()
-	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expired-cache status = %d, want 503; body=%s", rec.Code, rec.Body.String())
 	}
 
 	// Upstream refusing connections: health reports 503 starting state.
@@ -700,6 +696,7 @@ func TestHealthReportsUpstreamReadiness(t *testing.T) {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
+
 func TestDNSQuestionSection(t *testing.T) {
 	query := testQuery(17)
 	section, ok := dnsQuestionSection(query)
