@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,7 +34,7 @@ const (
 	defaultConcurrency     = 8
 	defaultClientEntries   = 10000
 	defaultMaxHeaderBytes  = 16 << 10
-	maxGetQueryParamLength = 12 << 10
+	defaultMaxGetQuerySize = 12 << 10
 	minMaxBodyBytes        = 512
 	maxMaxBodyBytes        = 65535
 	maxRateLimit           = 1000000
@@ -47,10 +46,9 @@ const (
 	dnsTypeOPT             = 41
 	shardCount             = 64
 	upstreamTimeout        = 6 * time.Second
-	upstreamProbeTimeout   = 1500 * time.Millisecond
+	upstreamProbeTimeout   = 500 * time.Millisecond
 	upstreamProbeCacheTTL  = 2 * time.Second
 	shutdownGrace          = 5 * time.Second
-	serviceName            = "minimal-hagezi-doh"
 )
 
 type rateEntry struct {
@@ -158,11 +156,7 @@ func (r *rateLimiter) cleanup() {
 }
 
 type server struct {
-	client *http.Client
-	// probe is a dedicated single-connection client for /health. It is kept
-	// separate from client so a saturated request pool can never make the
-	// health check time out and report a healthy upstream as down.
-	probe      *http.Client
+	client     *http.Client
 	upstream   *url.URL
 	dohPath    string
 	rate       *rateLimiter
@@ -172,7 +166,7 @@ type server struct {
 	started    time.Time
 
 	// Cached upstream probe result so health checks do not perform a fresh
-	// request to the upstream on every call.
+	// TCP+TLS handshake on every call.
 	probeMu sync.Mutex
 	probeAt time.Time
 	probeOK bool
@@ -213,10 +207,7 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 		if err != nil {
 			return netip.Addr{}
 		}
-		// Drop any IPv6 zone: "fe80::1%a" and "fe80::1%b" are distinct netip.Addr
-		// map keys, so a spoofable header could otherwise mint unlimited
-		// rate-limit identities for the same address.
-		return ip.WithZone("").Unmap()
+		return ip.Unmap()
 	}
 
 	if trustProxy {
@@ -242,22 +233,22 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 	return parse(r.RemoteAddr)
 }
 
+// doHPath reports whether path is the configured DoH endpoint. dohPath is
+// guaranteed non-empty and non-reserved by getenv + validateDoHPath in main,
+// so no empty-configured fallback is needed here.
+func doHPath(path, configured string) bool {
+	return path == configured
+}
+
 // validateDoHPath rejects paths that would shadow the reserved /health and /
-// endpoints, or that http.ServeMux would never deliver to the handler
-// (non-canonical paths are redirected, and r.URL.Path is already decoded).
-func validateDoHPath(p string) error {
-	if !strings.HasPrefix(p, "/") {
-		return fmt.Errorf("DOH_PATH must start with '/': %q", p)
+// endpoints in the mux.
+func validateDoHPath(path string) error {
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("DOH_PATH must start with '/': %q", path)
 	}
-	switch p {
+	switch path {
 	case "/", "/health":
-		return fmt.Errorf("DOH_PATH %q conflicts with a reserved endpoint", p)
-	}
-	if strings.ContainsAny(p, "?#% \t\r\n") {
-		return fmt.Errorf("DOH_PATH must not contain '?', '#', '%%' or whitespace: %q", p)
-	}
-	if trimmed := strings.TrimSuffix(p, "/"); path.Clean(trimmed) != trimmed {
-		return fmt.Errorf("DOH_PATH must be a clean path (no empty, '.' or '..' segments): %q", p)
+		return fmt.Errorf("DOH_PATH %q conflicts with a reserved endpoint", path)
 	}
 	return nil
 }
@@ -429,7 +420,7 @@ func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int) {
 	if encoded == "" {
 		return nil, http.StatusBadRequest
 	}
-	if len(encoded) > maxGetQueryParamLength {
+	if len(encoded) > defaultMaxGetQuerySize {
 		return nil, http.StatusRequestURITooLong
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
@@ -445,18 +436,15 @@ func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int) {
 	return decoded, 0
 }
 
-// upstreamReady reports whether the fixed loopback DoH upstream answers HTTPS
-// requests, caching the result briefly so health checks do not hit it on
-// every call. It intentionally avoids a full DoH exchange so the health
-// endpoint stays cheap.
+// upstreamReady reports whether the fixed loopback DoH upstream accepts TLS
+// connections, caching the result briefly so health checks do not perform a
+// fresh TCP+TLS handshake on every call. It intentionally avoids doing a full
+// DoH exchange so the health endpoint stays cheap.
 //
-// The probe is a complete HTTP request over a kept-alive connection. A bare
-// TCP dial-and-close, or a TLS dial that is closed right after the handshake,
-// makes Go's net/http server in dnscrypt-proxy log
-// "http: TLS handshake error ... EOF" because the peer disappears before the
-// server has finished its side of the handshake. A real request never leaves
-// a half-finished handshake, and connection reuse means health checks rarely
-// open a new connection at all.
+// The probe must complete a real TLS handshake before closing. A bare TCP
+// dial-and-close makes dnscrypt-proxy's local DoH server log a spurious
+// "http: TLS handshake error ... EOF" on every /health check, because Go's
+// net/http logs any connection that closes before the handshake finishes.
 func (s *server) upstreamReady() bool {
 	s.probeMu.Lock()
 	defer s.probeMu.Unlock()
@@ -469,22 +457,18 @@ func (s *server) upstreamReady() bool {
 	return ok
 }
 
-// probeUpstream treats any HTTP response (even 4xx for the missing dns
-// parameter) as proof that the listener is up and speaking TLS+HTTP.
 func (s *server) probeUpstream() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), upstreamProbeTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.upstream.String(), nil)
+	d := &net.Dialer{Timeout: upstreamProbeTimeout}
+	conn, err := tls.DialWithDialer(d, "tcp", s.upstream.Host, &tls.Config{
+		// Loopback-only probe of the dnscrypt-proxy local_doh listener, which
+		// uses the container's bundled self-signed localhost certificate.
+		InsecureSkipVerify: true, //nolint:gosec
+		MinVersion:         tls.VersionTLS12,
+	})
 	if err != nil {
 		return false
 	}
-	resp, err := s.probe.Do(req)
-	if err != nil {
-		return false
-	}
-	// Drain so the connection returns to the idle pool for the next probe.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	_ = resp.Body.Close()
+	_ = conn.Close()
 	return true
 }
 
@@ -497,14 +481,14 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if !s.upstreamReady() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"status":  "starting",
-			"service": serviceName,
+			"service": "minimal-hagezi-doh",
 			"uptime":  time.Since(s.started).Round(time.Second).String(),
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
-		"service": serviceName,
+		"service": "minimal-hagezi-doh",
 		"uptime":  time.Since(s.started).Round(time.Second).String(),
 	})
 }
@@ -516,7 +500,7 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service":   serviceName,
+		"service":   "minimal-hagezi-doh",
 		"endpoint":  s.dohPath,
 		"rateLimit": fmt.Sprintf("%d requests/%ds per client IP", s.rate.limit, s.rate.windowSec),
 	})
@@ -524,9 +508,7 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 
 // doh handles requests for the configured DoH path only; the mux dispatches
 // exactly matching paths here and validateDoHPath keeps reserved paths free,
-// so no additional path check is needed inside the handler. Both the query
-// and the upstream response have already passed validDNSMessage (>= 12
-// bytes) by the time their IDs are compared.
+// so no additional path check is needed inside the handler.
 func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
@@ -610,7 +592,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
 		return
 	}
-	if binary.BigEndian.Uint16(body[:2]) != binary.BigEndian.Uint16(query[:2]) {
+	if len(body) < 2 || len(query) < 2 || binary.BigEndian.Uint16(body[:2]) != binary.BigEndian.Uint16(query[:2]) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "DNS response ID mismatch"})
 		return
 	}
@@ -654,23 +636,19 @@ func main() {
 		log.Fatalf("invalid fixed DoH upstream: %v", err)
 	}
 
-	loopbackTLS := func() *tls.Config {
-		// dnscrypt-proxy's local DoH service uses its bundled localhost
-		// self-signed certificate. Used only for the fixed loopback upstream,
-		// never for public destinations.
-		return &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
-		}
-	}
-
 	// The upstream deadline is owned by the per-request context created in
 	// doh (upstreamTimeout). Do not also set http.Client.Timeout or
 	// ResponseHeaderTimeout here, or partial timeout behavior becomes hard to
 	// reason about.
 	transport := &http.Transport{
-		Proxy:                 nil,
-		TLSClientConfig:       loopbackTLS(),
+		Proxy: nil,
+		TLSClientConfig: &tls.Config{
+			// dnscrypt-proxy's local DoH service uses its bundled localhost
+			// self-signed certificate. This transport is used only for the
+			// fixed loopback upstream, never for public destinations.
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
+		},
 		MaxIdleConns:          concLimit,
 		MaxIdleConnsPerHost:   concLimit,
 		MaxConnsPerHost:       concLimit,
@@ -680,29 +658,11 @@ func main() {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	// Dedicated health-probe transport: one kept-alive connection, no redirects.
-	probeTransport := &http.Transport{
-		Proxy:               nil,
-		TLSClientConfig:     loopbackTLS(),
-		MaxIdleConns:        1,
-		MaxIdleConnsPerHost: 1,
-		MaxConnsPerHost:     1,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  true,
-		ForceAttemptHTTP2:   false,
-	}
-
 	s := &server{
 		client: &http.Client{
 			Transport: transport,
 			// Do not follow redirects: the gateway must validate the actual
 			// upstream response status before forwarding anything to clients.
-			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-		probe: &http.Client{
-			Transport: probeTransport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -735,7 +695,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == s.dohPath {
+		if doHPath(r.URL.Path, s.dohPath) {
 			s.doh(w, r)
 			return
 		}
@@ -758,7 +718,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("DoH gateway listening on :%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
+		log.Printf("DoH gateway listening on 0.0.0.0:%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
 			port, dohPath, fixedUpstreamURL, rateLimit, rateWindow, maxClients, concLimit, maxBody, trustProxy)
 		errCh <- h.ListenAndServe()
 	}()

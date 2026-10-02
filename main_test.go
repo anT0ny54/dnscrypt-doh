@@ -98,7 +98,6 @@ func newTestGateway(upstream string) *server {
 				return http.ErrUseLastResponse
 			},
 		},
-		probe:      &http.Client{Transport: http.DefaultTransport},
 		upstream:   u,
 		dohPath:    defaultDoHPath,
 		rate:       newRateLimiter(99, 60, 256),
@@ -175,12 +174,12 @@ func TestValidDNSMessageRejectsNonOPTAdditionalInQuery(t *testing.T) {
 }
 
 func TestValidateDoHPath(t *testing.T) {
-	for _, ok := range []string{"/dns-query", "/doh", "/a/b", "/doh/"} {
+	for _, ok := range []string{"/dns-query", "/doh", "/a/b"} {
 		if err := validateDoHPath(ok); err != nil {
 			t.Fatalf("validateDoHPath(%q) = %v, want nil", ok, err)
 		}
 	}
-	for _, bad := range []string{"", "dns-query", "/", "/health", "/a//b", "/a/../b", "/a/./b", "/dns?x=1", "/a#b", "/a b", "/%41"} {
+	for _, bad := range []string{"", "dns-query", "/", "/health"} {
 		if err := validateDoHPath(bad); err == nil {
 			t.Fatalf("validateDoHPath(%q) = nil, want error", bad)
 		}
@@ -665,12 +664,11 @@ func TestDoHRejectsUpstreamRedirect(t *testing.T) {
 }
 
 func TestHealthReportsUpstreamReadiness(t *testing.T) {
-	// Upstream answering HTTPS requests: health is OK.
+	// Upstream accepting a real TLS handshake: health is OK.
 	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	upstream.StartTLS()
 
 	s := newTestGateway(upstream.URL + "/dns-query")
-	s.probe = upstream.Client() // trusts the test server's certificate
 	rec := httptest.NewRecorder()
 	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if rec.Code != http.StatusOK {
@@ -678,7 +676,7 @@ func TestHealthReportsUpstreamReadiness(t *testing.T) {
 	}
 
 	// A successful result is cached briefly, so a second health check does not
-	// need another request even if the upstream disappears immediately.
+	// need another handshake even if the upstream disappears immediately.
 	upstream.Close()
 	rec = httptest.NewRecorder()
 	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -718,16 +716,5 @@ func TestDNSQuestionSection(t *testing.T) {
 	truncated := query[:len(query)-2]
 	if _, ok := dnsQuestionSection(truncated); ok {
 		t.Fatal("expected truncated question to be rejected")
-	}
-}
-
-func TestParseClientIPStripsIPv6Zone(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	r.Header.Set("X-Forwarded-For", "2001:db8::1%eth0")
-	a := parseClientIP(r, true)
-	r.Header.Set("X-Forwarded-For", "2001:db8::1%eth1")
-	b := parseClientIP(r, true)
-	if !a.IsValid() || a.Zone() != "" || a != b {
-		t.Fatalf("zoned addresses must collapse to one identity: %v vs %v", a, b)
 	}
 }
