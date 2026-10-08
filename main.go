@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -31,17 +32,17 @@ const (
 	fixedUpstreamURL       = "https://127.0.0.1:8053/dns-query"
 	defaultRateLimit       = 99
 	defaultRateWindowSec   = 60
-	defaultMaxBodyBytes    = 4096
+	defaultMaxBodyBytes    = 8192
 	defaultConcurrency     = 8
-	defaultClientEntries   = 10000
+	defaultClientEntries   = 8192
 	defaultMaxHeaderBytes  = 16 << 10
 	defaultMaxGetQuerySize = 12 << 10
 	minMaxBodyBytes        = 512
 	maxMaxBodyBytes        = 65535
 	maxRateLimit           = 1000000
 	maxRateWindowSec       = 86400
-	maxConcurrency         = 512
-	maxClientEntries       = 1000000
+	maxConcurrency         = 16
+	maxClientEntries       = 32768
 	maxDNSNameBytes        = 255
 	maxDNSRecords          = 4096
 	dnsTypeOPT             = 41
@@ -67,10 +68,11 @@ type rateShard struct {
 }
 
 type rateLimiter struct {
-	shards             [shardCount]rateShard
-	limit              uint32
-	windowSec          uint64
-	maxEntriesPerShard int
+	shards     [shardCount]rateShard
+	limit      uint32
+	windowSec  uint64
+	maxEntries int64
+	entries    atomic.Int64
 }
 
 func newRateLimiter(limit, windowSec, maxEntries int) *rateLimiter {
@@ -84,12 +86,9 @@ func newRateLimiter(limit, windowSec, maxEntries int) *rateLimiter {
 		maxEntries = defaultClientEntries
 	}
 	r := &rateLimiter{
-		limit:     uint32(limit),
-		windowSec: uint64(windowSec),
-		// Round up so the configured client-entry limit is fully usable.
-		// Aggregate capacity can exceed the configured value by at most
-		// shardCount-1 entries.
-		maxEntriesPerShard: (maxEntries + shardCount - 1) / shardCount,
+		limit:      uint32(limit),
+		windowSec:  uint64(windowSec),
+		maxEntries: int64(maxEntries),
 	}
 	// Allocate shard maps lazily. A large MAX_CLIENT_IPS value should not
 	// reserve map buckets for every shard before the first client arrives.
@@ -116,7 +115,7 @@ func (r *rateLimiter) allow(ip netip.Addr) bool {
 	}
 	// Rate-limit IPv6 clients per /64: a single subscriber normally controls
 	// a whole /64, so per-address keys would let one host mint unlimited
-	// identities, bypass the limit, and fill limiter shards (which fail closed).
+	// identities and bypass the per-client quota.
 	if ip.Is6() {
 		if p, err := ip.Prefix(64); err == nil {
 			ip = p.Addr()
@@ -130,18 +129,15 @@ func (r *rateLimiter) allow(ip netip.Addr) bool {
 
 	entry, ok := sh.m[ip]
 	if !ok {
-		if len(sh.m) >= r.maxEntriesPerShard {
-			// Periodic cleanup owns expiration. Do not scan a full shard on the
-			// request path, or a client churn burst could turn this into O(n)
-			// work per rejected identity.
+		// The global entry counter is the hard capacity guard. A previous
+		// per-shard-only cap could reject a client merely because its hash
+		// bucket filled early, even when other shards still had capacity.
+		if !r.reserveEntry() {
 			return false
 		}
 		entry = rateEntry{window: nowWindow}
 	}
 	if sh.m == nil {
-		// No capacity hint: hinting maxEntriesPerShard would reserve buckets
-		// for the whole shard capacity on first use (tens of MB in total at
-		// MAX_CLIENT_IPS=1,000,000), defeating the lazy allocation.
 		sh.m = make(map[netip.Addr]rateEntry)
 	}
 
@@ -157,10 +153,22 @@ func (r *rateLimiter) allow(ip netip.Addr) bool {
 	return true
 }
 
+func (r *rateLimiter) reserveEntry() bool {
+	for {
+		current := r.entries.Load()
+		if current >= r.maxEntries {
+			return false
+		}
+		if r.entries.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
 // cleanupInterval bounds how long expired entries can occupy limiter slots.
 // Ticking only once per RATE_WINDOW_SECONDS let expired entries linger for up
-// to a whole extra window (a day at the 86,400 maximum), and because a full
-// shard fails closed, new clients could be refused during that time.
+// to a whole extra window (a day at the 86,400 maximum), so stale entries could
+// otherwise occupy global client capacity longer than necessary.
 func cleanupInterval(windowSec int) time.Duration {
 	if windowSec > maxCleanupIntervalSec {
 		windowSec = maxCleanupIntervalSec
@@ -176,6 +184,7 @@ func (r *rateLimiter) cleanup() {
 		for k, v := range sh.m {
 			if v.window != nowWindow {
 				delete(sh.m, k)
+				r.entries.Add(-1)
 			}
 		}
 		sh.mu.Unlock()
@@ -465,7 +474,8 @@ func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int) {
 	if encoded == "" {
 		return nil, http.StatusBadRequest
 	}
-	if len(encoded) > defaultMaxGetQuerySize {
+	maxEncoded := base64.RawURLEncoding.EncodedLen(int(maxBody))
+	if len(encoded) > maxEncoded || len(encoded) > defaultMaxGetQuerySize {
 		return nil, http.StatusRequestURITooLong
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
@@ -557,6 +567,18 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Acquire the concurrency slot before reading or decoding request data.
+	// This keeps body parsing and base64 work bounded under a burst of unique
+	// client IPs, which is important on the 0.25-vCPU tier.
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server concurrency limit reached"})
+		return
+	}
+
 	ip := parseClientIP(r, s.trustProxy)
 	if !s.rate.allow(ip) {
 		w.Header().Set("Retry-After", strconv.FormatUint(s.rate.windowSec, 10))
@@ -576,15 +598,6 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeJSON(w, status, map[string]string{"error": "invalid DNS query"})
 		}
-		return
-	}
-
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	default:
-		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server concurrency limit reached"})
 		return
 	}
 

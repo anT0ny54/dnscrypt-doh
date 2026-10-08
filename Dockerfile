@@ -17,7 +17,7 @@ COPY --from=build /out/localhost.pem /etc/localhost.pem
 COPY dnscrypt-proxy.toml /etc/dnscrypt-proxy.toml
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod 0755 /usr/local/bin/dnscrypt-proxy /usr/local/bin/doh-gateway /entrypoint.sh && chmod 0600 /etc/localhost.pem && chown doh:doh /etc/localhost.pem
-ENV GOMAXPROCS=1 GOGC=75 GOMEMLIMIT=192MiB PORT=8080 DOH_PATH=/dns-query RATE_LIMIT=99 RATE_WINDOW_SECONDS=60 MAX_DNS_MESSAGE_BYTES=4096 MAX_CONCURRENCY=8 MAX_CLIENT_IPS=10000 TRUST_PROXY_HEADERS=true
+ENV GOMAXPROCS=1 GOGC=100 GOMEMLIMIT=160MiB PORT=8080 DOH_PATH=/dns-query RATE_LIMIT=99 RATE_WINDOW_SECONDS=60 MAX_DNS_MESSAGE_BYTES=8192 MAX_CONCURRENCY=8 MAX_CLIENT_IPS=8192 TRUST_PROXY_HEADERS=true
 EXPOSE 8080
 USER doh
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 CMD wget -q -O - http://127.0.0.1:${PORT}/health >/dev/null || exit 1

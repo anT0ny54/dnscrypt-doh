@@ -59,11 +59,11 @@ All gateway settings are environment variables. Invalid or out-of-range numeric 
 | `DOH_PATH` | `/dns-query` | `/dns-query` | Canonical absolute path; must not be `/` or `/health`, or contain `?`, `#` or `%` |
 | `RATE_LIMIT` | `99` | `99` | 1-1,000,000 requests per window per client (IPv4 address or IPv6 /64) |
 | `RATE_WINDOW_SECONDS` | `60` | `60` | 1-86,400 |
-| `MAX_DNS_MESSAGE_BYTES` | `4096` | `4096` | 512-65,535 |
-| `MAX_CONCURRENCY` | `8` | `8` | 1-512 |
-| `MAX_CLIENT_IPS` | `10000` | `10000` | 64-1,000,000 tracked clients (IPv4 addresses or IPv6 /64 prefixes) |
+| `MAX_DNS_MESSAGE_BYTES` | `8192` | `8192` | 512-65,535 |
+| `MAX_CONCURRENCY` | `8` | `8` | 1-16 |
+| `MAX_CLIENT_IPS` | `8192` | `8192` | 64-32,768 tracked clients (IPv4 addresses or IPv6 /64 prefixes) |
 | `TRUST_PROXY_HEADERS` | `false` | `true` | `1/true/yes/on` or `0/false/no/off` |
-| `GOMAXPROCS`, `GOGC`, `GOMEMLIMIT` | Go runtime defaults | `1`, `75`, `192MiB` | Applies independently to each Go process |
+| `GOMAXPROCS`, `GOGC`, `GOMEMLIMIT` | Go runtime defaults | `1`, `100`, `160MiB` | Applies independently to each Go process |
 
 ### `DOH_PATH` rules
 
@@ -82,9 +82,9 @@ The internal upstream URL `https://127.0.0.1:8053/dns-query` is fixed in `main.g
 
 The default allows 99 `/dns-query` requests per fixed 60-second window per client. A client is an IPv4 address, or the /64 prefix of an IPv6 address, so a single IPv6 subscriber cannot obtain extra quota by rotating addresses inside its /64. Malformed requests on supported methods consume quota; `/health` and `/` are not rate-limited.
 
-The limiter uses 64 shards, lazy per-shard maps, direct map-value entries, and fail-closed full shards. Its cleanup interval is the configured window capped at 30 seconds. Per-shard capacity is rounded up so the configured `MAX_CLIENT_IPS` is fully usable, with aggregate capacity potentially exceeding it by at most 63 entries.
+The limiter uses 64 shards, lazy per-shard maps, direct map-value entries, and a global atomic entry cap. This avoids false `503` responses caused by one hash shard filling before the configured client-table limit is reached. Its cleanup interval is the configured window capped at 30 seconds.
 
-A global concurrency semaphore defaults to 8 simultaneous DoH requests. When full, new requests receive HTTP 503 with `Retry-After: 1`; malformed requests are rejected before consuming a semaphore slot.
+A global concurrency semaphore defaults to 8 simultaneous DoH requests. It is acquired before request-body/base64 parsing so CPU and memory spent on decoding are bounded under request floods. When full, new requests receive HTTP 503 with `Retry-After: 1`; the slot is released for every response path.
 
 ## SnapDeploy deployment
 
@@ -137,16 +137,16 @@ Set it to `false` when the port is directly reachable. The provided Compose serv
 The image sets:
 
 - `GOMAXPROCS=1`
-- `GOGC=75`
-- `GOMEMLIMIT=192MiB`
+- `GOGC=100`
+- `GOMEMLIMIT=160MiB`
 
 Those Go settings apply independently to the gateway and dnscrypt-proxy. The 512 MB container also uses:
 
-- dnscrypt-proxy cache: 32,768 entries
-- localhost DNS client ceiling: 32
-- public client-identity ceiling: 10,000
-- gateway concurrency ceiling: 8
-- default DNS message size: 4,096 bytes
+- dnscrypt-proxy cache: 16,384 entries
+- localhost DNS client ceiling: 16
+- public client-identity ceiling: 8,192
+- gateway concurrency ceiling: 8 (16 hard cap)
+- default DNS message size: 8,192 bytes
 
 The gateway binds its socket before announcing startup, validates the configured path before serving, drains for up to 5 seconds on shutdown, and does not follow upstream redirects.
 
@@ -162,7 +162,7 @@ The Compose service optionally loads variables from `.env` (this needs Docker Co
 cp .env.example .env
 ```
 
-The explicit Compose `environment` mapping takes precedence over `.env`, so `TRUST_PROXY_HEADERS` in `.env` is ignored by Compose. By default, Compose only overrides `TRUST_PROXY_HEADERS=true` because the local port is published in SnapDeploy's sanitizing edge. The published port follows `PORT` when it is set in `.env`.
+The explicit Compose `environment` mapping takes precedence over `.env`, so `TRUST_PROXY_HEADERS` in `.env` is ignored by Compose. By default, Compose overrides the image setting to `TRUST_PROXY_HEADERS=true` because the local port is directly reachable SnapDeploy's edge. The published port follows `PORT` when it is set in `.env`.
 
 The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. The runtime image runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds.
 

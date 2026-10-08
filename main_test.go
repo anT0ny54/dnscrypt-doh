@@ -269,13 +269,22 @@ func TestRateLimiterAllocatesShardMapsLazily(t *testing.T) {
 	}
 }
 
-func TestRateLimiterRoundsUpShardCapacity(t *testing.T) {
+func TestRateLimiterTracksGlobalCapacityAcrossShards(t *testing.T) {
 	r := newRateLimiter(1, 60, 65)
-	if got, want := r.maxEntriesPerShard, 2; got != want {
-		t.Fatalf("maxEntriesPerShard = %d, want %d (65 entries across 64 shards rounds up)", got, want)
+	if got, want := r.entries.Load(), int64(0); got != want {
+		t.Fatalf("initial entries = %d, want %d", got, want)
 	}
-	if got, want := r.maxEntriesPerShard*shardCount, 128; got != want {
-		t.Fatalf("aggregate capacity = %d, want %d", got, want)
+	for i := 1; i <= 65; i++ {
+		ip := netip.AddrFrom4([4]byte{198, 18, byte(i / 256), byte(i % 256)})
+		if !r.allow(ip) {
+			t.Fatalf("client %d was rejected before global capacity was reached", i)
+		}
+	}
+	if got := r.entries.Load(); got != 65 {
+		t.Fatalf("entries = %d, want 65", got)
+	}
+	if r.allow(netip.MustParseAddr("203.0.113.254")) {
+		t.Fatal("client beyond global capacity should be rejected")
 	}
 }
 
@@ -324,7 +333,7 @@ func TestParseClientIPCanonicalizesMappedIPv4(t *testing.T) {
 	}
 }
 
-func TestRateLimiterFullShardFailsClosed(t *testing.T) {
+func TestRateLimiterSharedShardDoesNotReduceGlobalCapacity(t *testing.T) {
 	r := newRateLimiter(99, 60, 64)
 	var first, second netip.Addr
 	seen := make(map[uint64]netip.Addr)
@@ -340,15 +349,26 @@ func TestRateLimiterFullShardFailsClosed(t *testing.T) {
 	if !first.IsValid() || !second.IsValid() {
 		t.Fatal("failed to find two client IPs sharing a rate-limit shard")
 	}
-	if !r.allow(first) {
-		t.Fatal("first client should be allowed")
+	if !r.allow(first) || !r.allow(second) {
+		t.Fatal("clients sharing a shard should both be admitted while global capacity remains")
 	}
-	if r.allow(second) {
-		t.Fatal("new client should fail closed when its shard is full")
+	if got := r.entries.Load(); got != 2 {
+		t.Fatalf("entries=%d; want 2", got)
 	}
-	idx := int(addrHash(first) % shardCount)
-	if got := len(r.shards[idx].m); got != 1 {
-		t.Fatalf("full shard size = %d, want 1", got)
+}
+
+func TestRateLimiterCleanupReleasesGlobalCapacity(t *testing.T) {
+	r := newRateLimiter(1, 60, 64)
+	ip := netip.MustParseAddr("192.0.2.30")
+	idx := int(addrHash(ip) % shardCount)
+	r.shards[idx].m = map[netip.Addr]rateEntry{ip: {window: 0, count: 1}}
+	r.entries.Store(1)
+	r.cleanup()
+	if got := r.entries.Load(); got != 0 {
+		t.Fatalf("entries after cleanup=%d; want 0", got)
+	}
+	if !r.allow(ip) {
+		t.Fatal("client should be admitted after stale capacity is reclaimed")
 	}
 }
 
@@ -442,7 +462,7 @@ func TestDoHGetIsDecodedAndForwardedAsPOST(t *testing.T) {
 	}
 }
 
-func TestDoHRejectsInvalidInputBeforeConcurrencyAcquire(t *testing.T) {
+func TestDoHRejectsInvalidInputWithinConcurrencyBudget(t *testing.T) {
 	s := newTestGateway("http://127.0.0.1:9/dns-query")
 	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader("not-dns"))
 	req.Header.Set("Content-Type", "application/dns-message")
@@ -452,7 +472,26 @@ func TestDoHRejectsInvalidInputBeforeConcurrencyAcquire(t *testing.T) {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 	if got := len(s.sem); got != 0 {
-		t.Fatalf("semaphore occupancy = %d, want 0", got)
+		t.Fatalf("semaphore occupancy = %d, want 0 after request", got)
+	}
+}
+
+func TestDoHConcurrencyGateRejectsBeforeReadingBody(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	for i := 0; i < cap(s.sem); i++ {
+		s.sem <- struct{}{}
+	}
+	body := &trackingBody{}
+	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, nil)
+	req.Body = body
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d; want 503", rec.Code)
+	}
+	if body.read {
+		t.Fatal("request body was read while concurrency gate was full")
 	}
 }
 

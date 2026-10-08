@@ -26,14 +26,14 @@ lb_estimator = true
 # Small, useful in-memory cache. This reduces duplicate upstream work
 # without making cache memory dominate a 512 MB container.
 cache = true
-cache_size = 32768
+cache_size = 16384
 cache_min_ttl = 30
 cache_max_ttl = 86400
 cache_neg_min_ttl = 15
 cache_neg_max_ttl = 300
 
 # Defensive defaults.
-max_clients = 32
+max_clients = 16
 block_unqualified = true
 block_undelegated = true
 ignore_system_dns = true
