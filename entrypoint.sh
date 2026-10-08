@@ -7,8 +7,9 @@ GATEWAY=/usr/local/bin/doh-gateway
 
 "$DNSCRYPT" -config "$CONFIG" -check
 
-# tini runs as PID 1 and reaps terminated children, so the kill -0 liveness
-# checks in the supervision loop below are reliable (no zombie children).
+# tini handles PID-1 signal/reaping duties. This shell remains the direct
+# parent of both services and reaps them via wait, so kill -0 can detect
+# termination without relying on a fixed startup sleep.
 # Readiness is intentionally NOT gated here with a fixed sleep: the gateway's
 # /health endpoint reports 503 until the dnscrypt-proxy DoH listener completes
 # a TLS handshake, which lets the container orchestrator observe real readiness

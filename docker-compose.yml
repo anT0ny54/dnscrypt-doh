@@ -4,8 +4,11 @@ services:
     # --platform; do not hard-code it here or arm64 hosts get an amd64 toolchain.
     build:
       context: .
+    # Compose reads PORT from a project-level .env for interpolation, so the
+    # published port follows a PORT override (which env_file also passes to the
+    # container) instead of silently diverging from it.
     ports:
-      - "8080:8080"
+      - "${PORT:-8080}:${PORT:-8080}"
     # Only values that differ from the image's baked-in Dockerfile ENV
     # defaults belong here, so nothing drifts out of sync with the Dockerfile.
     # The image defaults TRUST_PROXY_HEADERS=true (for SnapDeploy's managed
@@ -13,7 +16,14 @@ services:
     # directly with no such edge, so trusting those headers would let any
     # client spoof its IP via CF-Connecting-IP / X-Forwarded-For and bypass
     # the per-IP rate limit; hence it is disabled for local runs.
+    # Optional local overrides (copy .env.example to .env). The explicit
+    # environment mapping below takes precedence over env_file values, so
+    # TRUST_PROXY_HEADERS in .env is ignored here. The "required: true"
+    # env_file syntax needs Docker Compose 2.24 or newer.
+    env_file:
+      - path: .env
+        required: false
     environment:
-      TRUST_PROXY_HEADERS: "false"
+      TRUST_PROXY_HEADERS: "true"
     #   RATE_LIMIT: 20
     restart: unless-stopped

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,9 @@ const (
 	shutdownGrace          = 5 * time.Second
 	maxCleanupIntervalSec  = 30
 )
+
+// serviceName is reported by the / and /health endpoints.
+const serviceName = "minimal-hagezi-doh"
 
 type rateEntry struct {
 	window uint64
@@ -109,6 +113,14 @@ func addrHash(a netip.Addr) uint64 {
 func (r *rateLimiter) allow(ip netip.Addr) bool {
 	if !ip.IsValid() {
 		return false
+	}
+	// Rate-limit IPv6 clients per /64: a single subscriber normally controls
+	// a whole /64, so per-address keys would let one host mint unlimited
+	// identities, bypass the limit, and fill limiter shards (which fail closed).
+	if ip.Is6() {
+		if p, err := ip.Prefix(64); err == nil {
+			ip = p.Addr()
+		}
 	}
 	nowWindow := uint64(time.Now().Unix()) / r.windowSec
 	idx := int(addrHash(ip) % shardCount)
@@ -250,17 +262,41 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 	return parse(r.RemoteAddr)
 }
 
-// validateDoHPath rejects paths that would shadow the reserved /health and /
-// endpoints in the mux.
-func validateDoHPath(path string) error {
-	if !strings.HasPrefix(path, "/") {
-		return fmt.Errorf("DOH_PATH must start with '/': %q", path)
+// validateDoHPath rejects paths that cannot be reached by http.ServeMux and
+// paths that would shadow the reserved /health and / endpoints.
+func validateDoHPath(dohPath string) error {
+	if !strings.HasPrefix(dohPath, "/") {
+		return fmt.Errorf("DOH_PATH must start with '/': %q", dohPath)
 	}
-	switch path {
+	if strings.ContainsAny(dohPath, "?#%") {
+		// '%' is rejected because the mux matches the decoded URL path, so a
+		// configured percent-escape could never match a normal request.
+		return fmt.Errorf("DOH_PATH must not contain '?', '#' or '%%': %q", dohPath)
+	}
+	if canonicalHTTPPath(dohPath) != dohPath {
+		return fmt.Errorf("DOH_PATH must be canonical; repeated slashes and dot segments are redirected before matching: %q", dohPath)
+	}
+	switch dohPath {
 	case "/", "/health":
-		return fmt.Errorf("DOH_PATH %q conflicts with a reserved endpoint", path)
+		return fmt.Errorf("DOH_PATH %q conflicts with a reserved endpoint", dohPath)
 	}
 	return nil
+}
+
+// canonicalHTTPPath mirrors net/http's ServeMux path cleaning, including its
+// preservation of one trailing slash. A configured path that differs from the
+// cleaned form is unreachable because ServeMux redirects the request first.
+//
+// The caller (validateDoHPath) has already verified that p starts with "/".
+func canonicalHTTPPath(p string) string {
+	cleaned := path.Clean(p)
+	if strings.HasSuffix(p, "/") && cleaned != "/" {
+		if len(p) == len(cleaned)+1 && strings.HasPrefix(p, cleaned) {
+			return p
+		}
+		cleaned += "/"
+	}
+	return cleaned
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -373,8 +409,10 @@ func validDNSMessage(msg []byte, wantResponse bool) bool {
 		return false
 	}
 
+	// qdCount was required to be exactly one above, so parse the single
+	// question directly instead of looping over a count that cannot repeat.
 	offset := 12
-	for i := 0; i < qdCount; i++ {
+	{
 		var ok bool
 		if offset, ok = dnsNameEnd(msg, offset); !ok || offset+4 > len(msg) {
 			return false
@@ -485,17 +523,13 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	status, state := http.StatusOK, "ok"
 	if !s.upstreamReady() {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"status":  "starting",
-			"service": "minimal-hagezi-doh",
-			"uptime":  time.Since(s.started).Round(time.Second).String(),
-		})
-		return
+		status, state = http.StatusServiceUnavailable, "starting"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"service": "minimal-hagezi-doh",
+	writeJSON(w, status, map[string]any{
+		"status":  state,
+		"service": serviceName,
 		"uptime":  time.Since(s.started).Round(time.Second).String(),
 	})
 }
@@ -507,7 +541,7 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service":   "minimal-hagezi-doh",
+		"service":   serviceName,
 		"endpoint":  s.dohPath,
 		"rateLimit": fmt.Sprintf("%d requests/%ds per client IP", s.rate.limit, s.rate.windowSec),
 	})
@@ -718,7 +752,6 @@ func main() {
 	})
 
 	h := &http.Server{
-		Addr:              ":" + port,
 		Handler:           mux,
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       7 * time.Second,
@@ -727,12 +760,18 @@ func main() {
 		MaxHeaderBytes:    defaultMaxHeaderBytes,
 	}
 
+	// Bind before announcing startup so an invalid or occupied port is
+	// reported here instead of racing with a signal in the goroutine below.
+	listener, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		log.Fatalf("listen on 0.0.0.0:%s: %v", port, err)
+	}
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("DoH gateway listening on 0.0.0.0:%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
-			port, dohPath, fixedUpstreamURL, rateLimit, rateWindow, maxClients, concLimit, maxBody, trustProxy)
-		errCh <- h.ListenAndServe()
+		errCh <- h.Serve(listener)
 	}()
+	log.Printf("DoH gateway listening on 0.0.0.0:%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
+		port, dohPath, fixedUpstreamURL, rateLimit, rateWindow, maxClients, concLimit, maxBody, trustProxy)
 
 	select {
 	case <-ctx.Done():

@@ -174,12 +174,24 @@ func TestValidDNSMessageRejectsNonOPTAdditionalInQuery(t *testing.T) {
 }
 
 func TestValidateDoHPath(t *testing.T) {
-	for _, ok := range []string{"/dns-query", "/doh", "/a/b"} {
+	for _, ok := range []string{"/dns-query", "/doh", "/a/b", "/doh/"} {
 		if err := validateDoHPath(ok); err != nil {
 			t.Fatalf("validateDoHPath(%q) = %v, want nil", ok, err)
 		}
 	}
-	for _, bad := range []string{"", "dns-query", "/", "/health"} {
+	for _, bad := range []string{
+		"",
+		"dns-query",
+		"/",
+		"/health",
+		"/doh//",
+		"/doh/./",
+		"/doh/../doh",
+		"/doh?dns=",
+		"/doh#fragment",
+		"//doh",
+		"/doh%2Fx",
+	} {
 		if err := validateDoHPath(bad); err == nil {
 			t.Fatalf("validateDoHPath(%q) = nil, want error", bad)
 		}
@@ -348,6 +360,22 @@ func TestRateLimiterUsesValueEntriesAndEnforcesLimit(t *testing.T) {
 	}
 	if r.allow(ip) {
 		t.Fatal("third request should be rejected")
+	}
+}
+
+func TestRateLimiterGroupsIPv6By64(t *testing.T) {
+	r := newRateLimiter(1, 60, 6400)
+	a := netip.MustParseAddr("2001:db8:1:2::1")
+	sameNet := netip.MustParseAddr("2001:db8:1:2:ffff::9")
+	otherNet := netip.MustParseAddr("2001:db8:1:3::1")
+	if !r.allow(a) {
+		t.Fatal("first request should be allowed")
+	}
+	if r.allow(sameNet) {
+		t.Fatal("another address in the same /64 must share the quota")
+	}
+	if !r.allow(otherNet) {
+		t.Fatal("an address in a different /64 must have its own quota")
 	}
 }
 

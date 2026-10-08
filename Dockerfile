@@ -2,6 +2,7 @@ FROM alpine:3.24.2 AS build
 ARG TARGETARCH
 RUN apk add --no-cache ca-certificates wget tar openssl
 WORKDIR /build
+RUN mkdir -p /out
 RUN set -eux; GO_VERSION=1.27.1; case "${TARGETARCH}" in amd64) GO_ARCH=amd64; GO_SHA=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445;; arm64) GO_ARCH=arm64; GO_SHA=3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec;; *) echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1;; esac; wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -O /tmp/go.tar.gz; echo "${GO_SHA}  /tmp/go.tar.gz" | sha256sum -c -; tar -C /usr/local -xzf /tmp/go.tar.gz; rm /tmp/go.tar.gz
 ENV PATH=/usr/local/go/bin:$PATH CGO_ENABLED=0
 RUN set -eux; DNSCRYPT_VERSION=2.1.18; DNSCRYPT_SHA256=9b810d862ba07c383cc0b8f9f7f1f2ca8f74a02f849d818c4c4d37cc21a7dfa6; wget -q "https://github.com/DNSCrypt/dnscrypt-proxy/archive/refs/tags/${DNSCRYPT_VERSION}.tar.gz" -O /tmp/dnscrypt.tar.gz; echo "${DNSCRYPT_SHA256}  /tmp/dnscrypt.tar.gz" | sha256sum -c -; mkdir -p /build/dnscrypt; tar -xzf /tmp/dnscrypt.tar.gz -C /build/dnscrypt --strip-components=1; rm /tmp/dnscrypt.tar.gz; cd /build/dnscrypt; go build -mod=vendor -trimpath -ldflags='-s -w' -o /out/dnscrypt-proxy ./dnscrypt-proxy; /out/dnscrypt-proxy -version

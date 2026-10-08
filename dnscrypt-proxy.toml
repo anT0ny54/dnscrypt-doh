@@ -33,7 +33,7 @@ cache_neg_min_ttl = 15
 cache_neg_max_ttl = 300
 
 # Defensive defaults.
-max_clients = 256
+max_clients = 32
 block_unqualified = true
 block_undelegated = true
 ignore_system_dns = true
@@ -44,7 +44,6 @@ netprobe_address = '9.9.9.9:53'
 # Do not write query logs in this minimal public service.
 log_level = 2
 log_file = '/dev/stdout'
-log_file_latest = true
 
 # Only these three HaGeZi resolvers are used. The stamps include the
 # resolver hostname and IPv4 address, avoiding dependence on a large
