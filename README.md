@@ -118,7 +118,7 @@ Returns a small service-information JSON response.
 `GET` and `POST` are supported on `DOH_PATH`; other methods return 405 with `Allow: GET, POST`.
 
 - `POST` requires `Content-Type: application/dns-message` and a body no larger than `MAX_DNS_MESSAGE_BYTES`.
-- `GET` requires an RFC 8484 `dns` parameter containing raw URL-safe base64 without padding. The encoded parameter is limited to 12,288 characters, which caps the decoded message at 9,216 bytes; `MAX_DNS_MESSAGE_BYTES` values above that only take effect for `POST`.
+- `GET` requires an RFC 8484 `dns` parameter containing raw URL-safe base64 without padding. The encoded parameter is hard-capped at 12,288 characters, which caps the decoded message at 9,216 bytes; with the default `MAX_DNS_MESSAGE_BYTES=8192` the binding limit is 10,923 characters (`base64.RawURLEncoding.EncodedLen(8192)`). `MAX_DNS_MESSAGE_BYTES` values above 9,216 therefore only take effect for `POST`.
 - Requests are validated as DNS wire format before forwarding: exactly one question, no answer or authority records, EDNS OPT-only additional records, 255-byte name limit, strict backward compression pointers, and a 4096-record ceiling.
 - Upstream responses must be valid DNS responses with matching ID and question section.
 - Upstream errors return 502; upstream timeouts return 504; the upstream deadline is 6 seconds and covers response-body reads.
@@ -128,9 +128,9 @@ Returns a small service-information JSON response.
 
 ## Proxy-header trust
 
-The gateway binary defaults to `TRUST_PROXY_HEADERS=true`; the image sets it to `true` for SnapDeploy. When enabled, it trusts `CF-Connecting-IP` and the first `X-Forwarded-For` value. Enable this only when the front edge overwrites those headers, because trusting spoofable headers lets clients bypass per-client rate limits.
+The gateway binary defaults to `TRUST_PROXY_HEADERS=false`; the container image sets it to `true`, and the provided Compose service keeps it `true`, because this project is deployed on SnapDeploy: the managed edge terminates TLS and overwrites `CF-Connecting-IP` and `X-Forwarded-For` before the gateway sees them, so the gateway must trust those headers to rate-limit the real client IP.
 
-Set it to `false` when the port is directly reachable. The provided Compose service does this for local runs. IPv6 zone identifiers are stripped before rate limiting.
+Keep `true` only while a front edge overwrites those headers. If you ever publish the port directly, with no such edge in front, set it to `false`: trusting spoofable headers in that setup lets clients bypass per-client rate limits. IPv6 zone identifiers are stripped before rate limiting either way.
 
 ## Performance notes
 
@@ -162,7 +162,7 @@ The Compose service optionally loads variables from `.env` (this needs Docker Co
 cp .env.example .env
 ```
 
-The explicit Compose `environment` mapping takes precedence over `.env`, so `TRUST_PROXY_HEADERS` in `.env` is ignored by Compose. By default, Compose overrides the image setting to `TRUST_PROXY_HEADERS=true` because the local port is directly reachable SnapDeploy's edge. The published port follows `PORT` when it is set in `.env`.
+The Compose service intentionally keeps `TRUST_PROXY_HEADERS=true`, matching the SnapDeploy deployment, so local runs behave exactly like production behind SnapDeploy's managed edge. The explicit Compose `environment` mapping takes precedence over `.env`, so `TRUST_PROXY_HEADERS` in `.env` is ignored by Compose. If you run the container with the port directly reachable and no header-overwriting edge in front, change the Compose value to `false` (see "Proxy-header trust"). The published port follows `PORT` when it is set in `.env`.
 
 The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. The runtime image runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds.
 

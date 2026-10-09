@@ -9,13 +9,15 @@ services:
     # container) instead of silently diverging from it.
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
-    # Only values that differ from the image's baked-in Dockerfile ENV
-    # defaults belong here, so nothing drifts out of sync with the Dockerfile.
-    # The image defaults TRUST_PROXY_HEADERS=true (for SnapDeploy's managed
-    # edge, which overwrites the client-IP headers). Here the port is published
-    # directly with no such edge, so trusting those headers would let any
-    # client spoof its IP via CF-Connecting-IP / X-Forwarded-For and bypass
-    # the per-IP rate limit; hence it is disabled for local runs.
+    # TRUST_PROXY_HEADERS stays "true" here on purpose: this project is
+    # deployed on SnapDeploy, whose managed edge terminates TLS and overwrites
+    # CF-Connecting-IP / X-Forwarded-For before the gateway sees them, so the
+    # gateway must trust those headers to rate-limit the real client IP. The
+    # value matches the image's baked-in Dockerfile ENV default and is kept
+    # explicit so local runs behave exactly like the SnapDeploy deployment.
+    # If you publish the port directly with no such edge in front, change it
+    # to "false": trusting spoofable headers in that setup would let any
+    # client bypass the per-IP rate limit.
     # Optional local overrides (copy .env.example to .env). The explicit
     # environment mapping below takes precedence over env_file values, so
     # TRUST_PROXY_HEADERS in .env is ignored here. The "required: true"
