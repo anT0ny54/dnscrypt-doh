@@ -1,0 +1,9 @@
+# Local environment overrides (never commit real .env files)
+.env
+
+# Release / upload artifacts
+*.zip
+
+# Written by the Keep-Alive workflow; the workflow force-adds it, and it is
+# ignored here so it does not clutter local working trees.
+keep-alive.txt
