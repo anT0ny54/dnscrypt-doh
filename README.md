@@ -128,7 +128,7 @@ Returns a small service-information JSON response.
 
 ## Proxy-header trust
 
-The gateway binary defaults to `TRUST_PROXY_HEADERS=false`; the container image sets it to `true`, and the provided Compose service keeps it `true`, because this project is deployed on SnapDeploy: the managed edge terminates TLS and overwrites `CF-Connecting-IP` and `X-Forwarded-For` before the gateway sees them, so the gateway must trust those headers to rate-limit the real client IP.
+The gateway binary defaults to `TRUST_PROXY_HEADERS=false`; the container image sets it to `true`, and the provided Compose service leaves that image default in place (it sets no `environment:` override), because this project is deployed on SnapDeploy: the managed edge terminates TLS and overwrites `CF-Connecting-IP` and `X-Forwarded-For` before the gateway sees them, so the gateway must trust those headers to rate-limit the real client IP.
 
 Keep `true` only while a front edge overwrites those headers. If you ever publish the port directly, with no such edge in front, set it to `false`: trusting spoofable headers in that setup lets clients bypass per-client rate limits. IPv6 zone identifiers are stripped before rate limiting either way.
 
@@ -162,7 +162,7 @@ The Compose service optionally loads variables from `.env` (this needs Docker Co
 cp .env.example .env
 ```
 
-The Compose service intentionally keeps `TRUST_PROXY_HEADERS=true`, matching the SnapDeploy deployment, so local runs behave exactly like production behind SnapDeploy's managed edge. The explicit Compose `environment` mapping takes precedence over `.env`, so `TRUST_PROXY_HEADERS` in `.env` is ignored by Compose. If you run the container with the port directly reachable and no header-overwriting edge in front, change the Compose value to `false` (see "Proxy-header trust"). The published port follows `PORT` when it is set in `.env`.
+The image bakes in `TRUST_PROXY_HEADERS=true`, matching the SnapDeploy deployment, so local runs behave exactly like production behind SnapDeploy's managed edge. The Compose file does not set it in an `environment:` mapping, so `TRUST_PROXY_HEADERS=false` in `.env` takes effect instead of being silently ignored — use that when you run the container with the port directly reachable and no header-overwriting edge in front (see "Proxy-header trust"). The published port follows `PORT` when it is set in `.env`.
 
 The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. The runtime image runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds.
 

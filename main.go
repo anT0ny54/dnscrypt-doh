@@ -99,8 +99,7 @@ func addrHash(a netip.Addr) uint64 {
 	b := a.As16()
 	var x uint64 = 0x9e3779b97f4a7c15
 	for i := 0; i < 16; i += 8 {
-		v := uint64(b[i]) | uint64(b[i+1])<<8 | uint64(b[i+2])<<16 | uint64(b[i+3])<<24 |
-			uint64(b[i+4])<<32 | uint64(b[i+5])<<40 | uint64(b[i+6])<<48 | uint64(b[i+7])<<56
+		v := binary.LittleEndian.Uint64(b[i:])
 		x ^= v + 0x9e3779b97f4a7c15 + (x << 6) + (x >> 2)
 		x ^= x >> 30
 		x *= 0xbf58476d1ce4e5b9
@@ -189,6 +188,18 @@ func (r *rateLimiter) cleanup() {
 		}
 		sh.mu.Unlock()
 	}
+}
+
+// loopbackTLSConfig is shared by the gateway's upstream HTTP transport and
+// the health probe. crypto/tls forbids modifying a Config once it is in use,
+// but sharing a read-only Config across goroutines is safe and avoids
+// re-allocating one for every 2-second probe.
+var loopbackTLSConfig = &tls.Config{
+	// dnscrypt-proxy's local DoH service uses its bundled localhost
+	// self-signed certificate. It is only ever used for the fixed loopback
+	// upstream, never for public destinations.
+	InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
+	MinVersion:         tls.VersionTLS12,
 }
 
 type server struct {
@@ -392,103 +403,119 @@ func dnsQuestionSection(msg []byte) ([]byte, bool) {
 	return msg[12 : end+4], true
 }
 
-func validDNSMessage(msg []byte, wantResponse bool) bool {
+// parseDNSMessage validates a DNS message and also returns qEnd, the offset
+// just past the question section (QNAME + QTYPE + QCLASS). Callers that have
+// validated a message can slice msg[12:qEnd] to compare question sections
+// without re-parsing them. On failure qEnd is 0.
+func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 	if len(msg) < 12 {
-		return false
+		return 0, false
 	}
 	flags := binary.BigEndian.Uint16(msg[2:4])
 	if (flags&0x8000 != 0) != wantResponse {
-		return false
+		return 0, false
 	}
 	qdCount := int(binary.BigEndian.Uint16(msg[4:6]))
 	anCount := int(binary.BigEndian.Uint16(msg[6:8]))
 	nsCount := int(binary.BigEndian.Uint16(msg[8:10]))
 	arCount := int(binary.BigEndian.Uint16(msg[10:12]))
 	if qdCount != 1 {
-		return false
+		return 0, false
 	}
 	// A query carries no answer or authority records. Additional records are
 	// only allowed for EDNS(0), whose resource type is OPT (41).
 	if !wantResponse && (anCount != 0 || nsCount != 0) {
-		return false
+		return 0, false
 	}
 
 	recordCount := anCount + nsCount + arCount
 	if recordCount > maxDNSRecords {
-		return false
+		return 0, false
 	}
 
 	// qdCount was required to be exactly one above, so parse the single
 	// question directly instead of looping over a count that cannot repeat.
 	offset := 12
 	{
-		var ok bool
-		if offset, ok = dnsNameEnd(msg, offset); !ok || offset+4 > len(msg) {
-			return false
+		var nameOK bool
+		if offset, nameOK = dnsNameEnd(msg, offset); !nameOK || offset+4 > len(msg) {
+			return 0, false
 		}
 		offset += 4 // QTYPE + QCLASS
 	}
+	qEnd = offset
 
 	for i := 0; i < recordCount; i++ {
-		var ok bool
-		if offset, ok = dnsNameEnd(msg, offset); !ok || offset+10 > len(msg) {
-			return false
+		var nameOK bool
+		if offset, nameOK = dnsNameEnd(msg, offset); !nameOK || offset+10 > len(msg) {
+			return 0, false
 		}
 		rtype := binary.BigEndian.Uint16(msg[offset : offset+2])
 		rdataLen := int(binary.BigEndian.Uint16(msg[offset+8 : offset+10]))
 		offset += 10
 		if offset+rdataLen > len(msg) {
-			return false
+			return 0, false
 		}
 		offset += rdataLen
 		if !wantResponse && rtype != dnsTypeOPT {
-			return false
+			return 0, false
 		}
 	}
 
-	return offset == len(msg)
+	return qEnd, offset == len(msg)
 }
 
-func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int) {
+func validDNSMessage(msg []byte, wantResponse bool) bool {
+	_, ok := parseDNSMessage(msg, wantResponse)
+	return ok
+}
+
+// readDNSQuery extracts and validates the DNS wire message from a DoH
+// request, returning the message along with qEnd, the offset just past its
+// question section, so the caller can compare question sections without a
+// second parse. The status return is a non-zero HTTP status code on failure.
+func readDNSQuery(r *http.Request, maxBody int64) (msg []byte, qEnd int, status int) {
 	if r.Method == http.MethodPost {
 		if !isDNSMessageContentType(r.Header.Get("Content-Type")) {
-			return nil, http.StatusUnsupportedMediaType
+			return nil, 0, http.StatusUnsupportedMediaType
 		}
 		if r.ContentLength > maxBody {
-			return nil, http.StatusRequestEntityTooLarge
+			return nil, 0, http.StatusRequestEntityTooLarge
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 		if err != nil {
-			return nil, http.StatusBadRequest
+			return nil, 0, http.StatusBadRequest
 		}
 		if int64(len(body)) > maxBody {
-			return nil, http.StatusRequestEntityTooLarge
+			return nil, 0, http.StatusRequestEntityTooLarge
 		}
-		if !validDNSMessage(body, false) {
-			return nil, http.StatusBadRequest
+		qEnd, ok := parseDNSMessage(body, false)
+		if !ok {
+			return nil, 0, http.StatusBadRequest
 		}
-		return body, 0
+		return body, qEnd, 0
 	}
 
 	encoded := r.URL.Query().Get("dns")
 	if encoded == "" {
-		return nil, http.StatusBadRequest
+		return nil, 0, http.StatusBadRequest
 	}
 	maxEncoded := base64.RawURLEncoding.EncodedLen(int(maxBody))
 	if len(encoded) > maxEncoded || len(encoded) > defaultMaxGetQuerySize {
-		return nil, http.StatusRequestURITooLong
+		return nil, 0, http.StatusRequestURITooLong
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, http.StatusBadRequest
+		return nil, 0, http.StatusBadRequest
 	}
 	if int64(len(decoded)) > maxBody {
-		return nil, http.StatusRequestEntityTooLarge
+		return nil, 0, http.StatusRequestEntityTooLarge
 	}
-	if !validDNSMessage(decoded, false) {
-		return nil, http.StatusBadRequest
+	qEnd, ok := parseDNSMessage(decoded, false)
+	if !ok {
+		return nil, 0, http.StatusBadRequest
 	}
-	return decoded, 0
+	return decoded, qEnd, 0
 }
 
 // upstreamReady reports whether the fixed loopback DoH upstream accepts TLS
@@ -514,12 +541,9 @@ func (s *server) upstreamReady() bool {
 
 func (s *server) probeUpstream() bool {
 	d := &net.Dialer{Timeout: upstreamProbeTimeout}
-	conn, err := tls.DialWithDialer(d, "tcp", s.upstream.Host, &tls.Config{
-		// Loopback-only probe of the dnscrypt-proxy local_doh listener, which
-		// uses the container's bundled self-signed localhost certificate.
-		InsecureSkipVerify: true, //nolint:gosec
-		MinVersion:         tls.VersionTLS12,
-	})
+	// The probe shares the transport's read-only loopbackTLSConfig instead
+	// of allocating a fresh tls.Config for every probe.
+	conn, err := tls.DialWithDialer(d, "tcp", s.upstream.Host, loopbackTLSConfig)
 	if err != nil {
 		return false
 	}
@@ -586,7 +610,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query, status := readDNSQuery(r, s.maxBody)
+	query, qEnd, status := readDNSQuery(r, s.maxBody)
 	if status != 0 {
 		switch status {
 		case http.StatusUnsupportedMediaType:
@@ -647,22 +671,25 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
 		return
 	}
-	if int64(len(body)) > s.maxBody || !validDNSMessage(body, true) {
+	if int64(len(body)) > s.maxBody {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
 		return
 	}
-	// Both messages passed validDNSMessage, so each is at least 12 bytes.
+	// parseDNSMessage validates the response and returns the offset just past
+	// its question section, so the question comparison below needs no second
+	// parse of either message.
+	respQEnd, ok := parseDNSMessage(body, true)
+	if !ok {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
+		return
+	}
+	// Both messages passed parseDNSMessage, so each is at least 12 bytes and
+	// qEnd/respQEnd mark the end of each question section.
 	if binary.BigEndian.Uint16(body[:2]) != binary.BigEndian.Uint16(query[:2]) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "DNS response ID mismatch"})
 		return
 	}
-	queryQuestion, ok := dnsQuestionSection(query)
-	if !ok {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS query"})
-		return
-	}
-	responseQuestion, ok := dnsQuestionSection(body)
-	if !ok || !bytes.Equal(queryQuestion, responseQuestion) {
+	if !bytes.Equal(query[12:qEnd], body[12:respQEnd]) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "DNS response question mismatch"})
 		return
 	}
@@ -701,14 +728,8 @@ func main() {
 	// ResponseHeaderTimeout here, or partial timeout behavior becomes hard to
 	// reason about.
 	transport := &http.Transport{
-		Proxy: nil,
-		TLSClientConfig: &tls.Config{
-			// dnscrypt-proxy's local DoH service uses its bundled localhost
-			// self-signed certificate. This transport is used only for the
-			// fixed loopback upstream, never for public destinations.
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
-		},
+		Proxy:               nil,
+		TLSClientConfig:     loopbackTLSConfig,
 		MaxIdleConns:        concLimit,
 		MaxIdleConnsPerHost: concLimit,
 		MaxConnsPerHost:     concLimit,
