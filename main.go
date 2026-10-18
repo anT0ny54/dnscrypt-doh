@@ -452,11 +452,6 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 	return qEnd, offset == len(msg)
 }
 
-func validDNSMessage(msg []byte, wantResponse bool) bool {
-	_, ok := parseDNSMessage(msg, wantResponse)
-	return ok
-}
-
 // readDNSQuery extracts and validates the DNS wire message from a DoH
 // request, returning the message along with qEnd, the offset just past its
 // question section, so the caller can compare question sections without a
