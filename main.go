@@ -390,19 +390,6 @@ func dnsNameEnd(msg []byte, offset int) (int, bool) {
 	}
 }
 
-// dnsQuestionSection returns the question section (QNAME + QTYPE + QCLASS)
-// of a DNS message that contains exactly one question.
-func dnsQuestionSection(msg []byte) ([]byte, bool) {
-	if len(msg) < 12 || binary.BigEndian.Uint16(msg[4:6]) != 1 {
-		return nil, false
-	}
-	end, ok := dnsNameEnd(msg, 12)
-	if !ok || end+4 > len(msg) {
-		return nil, false
-	}
-	return msg[12 : end+4], true
-}
-
 // parseDNSMessage validates a DNS message and also returns qEnd, the offset
 // just past the question section (QNAME + QTYPE + QCLASS). Callers that have
 // validated a message can slice msg[12:qEnd] to compare question sections
