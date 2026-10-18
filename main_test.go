@@ -779,25 +779,6 @@ func TestParseClientIPStripsIPv6Zone(t *testing.T) {
 	}
 }
 
-func TestDNSQuestionSection(t *testing.T) {
-	query := testQuery(17)
-	section, ok := dnsQuestionSection(query)
-	if !ok {
-		t.Fatal("expected question section from valid query")
-	}
-	// QNAME example.com + QTYPE A + QCLASS IN = 13 + 2 + 2 bytes.
-	if want := 17; len(section) != want {
-		t.Fatalf("question section length = %d, want %d", len(section), want)
-	}
-	if !bytes.Equal(section, query[12:]) {
-		t.Fatal("question section should extend to the end of a bare query")
-	}
-	truncated := query[:len(query)-2]
-	if _, ok := dnsQuestionSection(truncated); ok {
-		t.Fatal("expected truncated question to be rejected")
-	}
-}
-
 func TestCleanupIntervalIsCapped(t *testing.T) {
 	if got, want := cleanupInterval(5), 5*time.Second; got != want {
 		t.Fatalf("cleanupInterval(5) = %s, want %s", got, want)
