@@ -25,6 +25,19 @@ Dockerfile.
   the offset just past the question section, so the DoH handler no longer
   re-parses the question section to compare upstream responses. The
   `validDNSMessage` signature is unchanged.
+- `.dockerignore` now excludes documentation, CI, and Compose files
+  (`.github/`, `CHANGELOG.md`, `README.md`, `LICENSE`, `docker-compose.yml`,
+  `.env.example`, `.dockerignore`) from the Docker build context, shrinking
+  what gets sent to the builder; only the Dockerfile, `main.go`,
+  `main_test.go`, `go.mod`, `entrypoint.sh`, and `dnscrypt-proxy.toml` are
+  needed.
+
+### Removed
+
+- Dead code: `dnsQuestionSection` and its `TestDNSQuestionSection` test. It
+  became unreachable when question-section comparison switched to the
+  `qEnd` offsets returned by `parseDNSMessage`; `parseDNSMessage` already
+  covers the same validation.
 
 ### Fixed
 

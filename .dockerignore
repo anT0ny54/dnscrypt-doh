@@ -1,5 +1,10 @@
 .git
 .gitignore
+.github
+.dockerignore
+.env.example
+CHANGELOG.md
 README.md
 LICENSE
+docker-compose.yml
 *.zip

@@ -164,7 +164,7 @@ cp .env.example .env
 
 The image bakes in `TRUST_PROXY_HEADERS=true`, matching the SnapDeploy deployment, so local runs behave exactly like production behind SnapDeploy's managed edge. The Compose file does not set it in an `environment:` mapping, so `TRUST_PROXY_HEADERS=false` in `.env` takes effect instead of being silently ignored — use that when you run the container with the port directly reachable and no header-overwriting edge in front (see "Proxy-header trust"). The published port follows `PORT` when it is set in `.env`.
 
-The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. The runtime image runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds.
+The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. The `.dockerignore` keeps the build context minimal (source, Compose-independent config, and the entrypoint only). The runtime image runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds.
 
 ## Changelog
 
