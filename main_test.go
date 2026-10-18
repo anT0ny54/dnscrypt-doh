@@ -108,6 +108,13 @@ func newTestGateway(upstream string) *server {
 	}
 }
 
+// validDNSMessage is a test-only convenience wrapper around parseDNSMessage;
+// the production handler uses parseDNSMessage directly to also get qEnd.
+func validDNSMessage(msg []byte, wantResponse bool) bool {
+	_, ok := parseDNSMessage(msg, wantResponse)
+	return ok
+}
+
 func TestValidDNSMessages(t *testing.T) {
 	query := testQuery(1)
 	response := testResponse(query)
@@ -620,7 +627,7 @@ func TestDoHRejectsUnsupportedMethod(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.doh(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", rec.Code)
+		t.Fatalf("status = %d, write %d want 405", rec.Code, 0)
 	}
 	if got := rec.Header().Get("Allow"); got != "GET, POST" {
 		t.Fatalf("Allow = %q, want GET, POST", got)

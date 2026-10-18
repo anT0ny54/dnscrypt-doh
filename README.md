@@ -166,6 +166,10 @@ The image bakes in `TRUST_PROXY_HEADERS=true`, matching the SnapDeploy deploymen
 
 The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. The `.dockerignore` keeps the build context minimal (source, Compose-independent config, and the entrypoint only). The runtime image runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds.
 
+## Testing
+
+The gateway ships a comprehensive test suite (`main_test.go`) covering DNS wire-format validation (single question, EDNS OPT-only additional records, 255-byte names, backward-only compression pointers, 4,096-record ceiling), rate limiting (IPv6 /64 grouping, global capacity, cleanup), proxy-header parsing, path validation, upstream error handling, and graceful health-check caching. The Docker build refuses to produce an image if `go test` or `go vet` fails.
+
 ## Changelog
 
 See [`CHANGELOG.md`](CHANGELOG.md).

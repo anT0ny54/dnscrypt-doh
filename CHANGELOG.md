@@ -38,6 +38,9 @@ Dockerfile.
   became unreachable when question-section comparison switched to the
   `qEnd` offsets returned by `parseDNSMessage`; `parseDNSMessage` already
   covers the same validation.
+- `validDNSMessage` moved from `main.go` into `main_test.go`: after the
+  `parseDNSMessage` refactor it had no production callers left — only tests
+  used it, so it no longer ships in the gateway binary.
 
 ### Fixed
 
