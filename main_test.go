@@ -627,7 +627,7 @@ func TestDoHRejectsUnsupportedMethod(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.doh(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, write %d want 405", rec.Code, 0)
+		t.Fatalf("status = %d, want 405", rec.Code)
 	}
 	if got := rec.Header().Get("Allow"); got != "GET, POST" {
 		t.Fatalf("Allow = %q, want GET, POST", got)
