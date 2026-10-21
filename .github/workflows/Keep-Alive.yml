@@ -41,9 +41,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # keep-alive.txt is listed in .gitignore to keep local working
-          # trees clean, so the scheduled workflow must force-add it.
-          git add -f -- keep-alive.txt
+          git add -- keep-alive.txt
 
           if git diff --cached --quiet -- keep-alive.txt; then
             echo "No changes to commit"
@@ -54,4 +52,3 @@ jobs:
             -m "chore: update repository keep-alive [skip ci]"
 
           git push origin "HEAD:${GITHUB_REF_NAME}"
-          
