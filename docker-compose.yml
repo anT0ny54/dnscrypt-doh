@@ -24,4 +24,9 @@ services:
     env_file:
       - path: .env
         required: false
+    # Compose interpolation does not automatically pass shell variables into
+    # the container. Explicitly pass the resolved PORT so the listener and the
+    # published container port cannot diverge when the shell overrides .env.
+    environment:
+      PORT: "${PORT:-8080}"
     restart: unless-stopped

@@ -41,7 +41,9 @@ bootstrap_resolvers = ['9.9.9.11:53', '1.1.1.1:53']
 netprobe_timeout = 10
 netprobe_address = '9.9.9.9:53'
 
-# Do not write query logs in this minimal public service.
+# Query logging (query_log / nx_log) is intentionally not configured, so client
+# queries are never written. log_file only sends dnscrypt-proxy's own
+# operational log to stdout for the container runtime to capture.
 log_level = 2
 log_file = '/dev/stdout'
 

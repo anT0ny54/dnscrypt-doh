@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -90,7 +91,10 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func newTestGateway(upstream string) *server {
-	u, _ := url.Parse(upstream)
+	u, err := url.Parse(upstream)
+	if err != nil {
+		panic(err)
+	}
 	return &server{
 		client: &http.Client{
 			Transport: http.DefaultTransport,
@@ -98,14 +102,23 @@ func newTestGateway(upstream string) *server {
 				return http.ErrUseLastResponse
 			},
 		},
-		upstream:   u,
-		dohPath:    defaultDoHPath,
-		rate:       newRateLimiter(99, 60, 256),
-		sem:        make(chan struct{}, 2),
-		maxBody:    defaultMaxBodyBytes,
-		trustProxy: false,
-		started:    time.Now(),
+		upstreamURL:  upstream,
+		upstreamHost: u.Host,
+		dohPath:      defaultDoHPath,
+		rate:         newRateLimiter(99, 60, 256),
+		sem:          make(chan struct{}, 2),
+		maxBody:      defaultMaxBodyBytes,
+		trustProxy:   false,
+		started:      time.Now(),
 	}
+}
+
+// allow is a test-only convenience wrapper around allowWithRetryAfter; the
+// production handler uses allowWithRetryAfter directly to also get the
+// Retry-After value.
+func (r *rateLimiter) allow(ip netip.Addr) rateLimitResult {
+	result, _ := r.allowWithRetryAfter(ip)
+	return result
 }
 
 // validDNSMessage is a test-only convenience wrapper around parseDNSMessage;
@@ -177,6 +190,71 @@ func TestValidDNSMessageRejectsNonOPTAdditionalInQuery(t *testing.T) {
 	query := queryWithAdditional(23, 1) // A record in the additional section
 	if validDNSMessage(query, false) {
 		t.Fatal("expected query with non-OPT additional record to be rejected")
+	}
+}
+
+func TestValidDNSMessageRejectsDuplicateOPTRecords(t *testing.T) {
+	query := queryWithAdditional(24, dnsTypeOPT)
+	query[10], query[11] = 0, 2 // ARCOUNT = 2
+	query = append(query, []byte{
+		0x00,       // root owner name
+		0x00, 0x29, // OPT (41)
+		0x10, 0x00, // UDP payload size
+		0x00, 0x00, 0x00, 0x00, // extended RCODE, version, flags
+		0x00, 0x00, // empty RDATA
+	}...)
+	if validDNSMessage(query, false) {
+		t.Fatal("expected duplicate OPT records to be rejected")
+	}
+}
+
+func TestValidDNSResponseRejectsOPTOutsideAdditionalSection(t *testing.T) {
+	response := testResponse(testQuery(27))
+	response[7] = 2 // ANCOUNT = 2, placing the appended OPT in the answer section.
+	response = append(response, []byte{
+		0x00,       // root owner name
+		0x00, 0x29, // OPT (41)
+		0x10, 0x00, // UDP payload size
+		0x00, 0x00, 0x00, 0x00, // extended RCODE, version, flags
+		0x00, 0x00, // empty RDATA
+	}...)
+	if validDNSMessage(response, true) {
+		t.Fatal("expected OPT outside the additional section to be rejected")
+	}
+}
+
+func TestValidDNSResponseRejectsOPTNotLastInAdditionalSection(t *testing.T) {
+	response := testResponse(testQuery(28))
+	response[10], response[11] = 0, 2 // ARCOUNT = 2
+	response = append(response, []byte{
+		0x00,       // root owner name
+		0x00, 0x29, // OPT (41)
+		0x10, 0x00, // UDP payload size
+		0x00, 0x00, 0x00, 0x00, // extended RCODE, version, flags
+		0x00, 0x00, // empty RDATA
+		0x00,       // root owner name
+		0x00, 0x01, // A
+		0x00, 0x01, // IN
+		0x00, 0x00, 0x00, 0x3c, // TTL
+		0x00, 0x00, // empty RDATA
+	}...)
+	if validDNSMessage(response, true) {
+		t.Fatal("expected OPT not last in the additional section to be rejected")
+	}
+}
+
+func TestValidDNSMessageRejectsNonRootOPTName(t *testing.T) {
+	query := testQuery(25)
+	query[11] = 1 // ARCOUNT = 1
+	query = append(query, []byte{
+		0x01, 'x', 0x00, // non-root owner name
+		0x00, 0x29, // OPT (41)
+		0x10, 0x00, // UDP payload size
+		0x00, 0x00, 0x00, 0x00, // extended RCODE, version, flags
+		0x00, 0x00, // empty RDATA
+	}...)
+	if validDNSMessage(query, false) {
+		t.Fatal("expected OPT with a non-root owner name to be rejected")
 	}
 }
 
@@ -262,7 +340,7 @@ func TestRateLimiterAllocatesShardMapsLazily(t *testing.T) {
 	}
 
 	ip := netip.MustParseAddr("192.0.2.11")
-	if !r.allow(ip) {
+	if r.allow(ip) != rateAllowed {
 		t.Fatal("first request should be allowed")
 	}
 	used := 0
@@ -283,15 +361,30 @@ func TestRateLimiterTracksGlobalCapacityAcrossShards(t *testing.T) {
 	}
 	for i := 1; i <= 65; i++ {
 		ip := netip.AddrFrom4([4]byte{198, 18, byte(i / 256), byte(i % 256)})
-		if !r.allow(ip) {
+		if r.allow(ip) != rateAllowed {
 			t.Fatalf("client %d was rejected before global capacity was reached", i)
 		}
 	}
 	if got := r.entries.Load(); got != 65 {
 		t.Fatalf("entries = %d, want 65", got)
 	}
-	if r.allow(netip.MustParseAddr("203.0.113.254")) {
+	if r.allow(netip.MustParseAddr("203.0.113.254")) == rateAllowed {
 		t.Fatal("client beyond global capacity should be rejected")
+	}
+}
+
+func TestPortConfigurationFallsBackForInvalidValues(t *testing.T) {
+	for _, value := range []string{"not-a-port", "0", "65536", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("PORT", value)
+			if got := getenvInt("PORT", defaultPort, 1, 65535); got != defaultPort {
+				t.Fatalf("PORT=%q resolved to %d, want default %d", value, got, defaultPort)
+			}
+		})
+	}
+	t.Setenv("PORT", "9090")
+	if got := getenvInt("PORT", defaultPort, 1, 65535); got != 9090 {
+		t.Fatalf("valid PORT resolved to %d, want 9090", got)
 	}
 }
 
@@ -356,7 +449,7 @@ func TestRateLimiterSharedShardDoesNotReduceGlobalCapacity(t *testing.T) {
 	if !first.IsValid() || !second.IsValid() {
 		t.Fatal("failed to find two client IPs sharing a rate-limit shard")
 	}
-	if !r.allow(first) || !r.allow(second) {
+	if r.allow(first) != rateAllowed || r.allow(second) != rateAllowed {
 		t.Fatal("clients sharing a shard should both be admitted while global capacity remains")
 	}
 	if got := r.entries.Load(); got != 2 {
@@ -374,7 +467,7 @@ func TestRateLimiterCleanupReleasesGlobalCapacity(t *testing.T) {
 	if got := r.entries.Load(); got != 0 {
 		t.Fatalf("entries after cleanup=%d; want 0", got)
 	}
-	if !r.allow(ip) {
+	if r.allow(ip) != rateAllowed {
 		t.Fatal("client should be admitted after stale capacity is reclaimed")
 	}
 }
@@ -382,10 +475,10 @@ func TestRateLimiterCleanupReleasesGlobalCapacity(t *testing.T) {
 func TestRateLimiterUsesValueEntriesAndEnforcesLimit(t *testing.T) {
 	r := newRateLimiter(2, 60, 64)
 	ip := netip.MustParseAddr("192.0.2.10")
-	if !r.allow(ip) || !r.allow(ip) {
+	if r.allow(ip) != rateAllowed || r.allow(ip) != rateAllowed {
 		t.Fatal("first two requests should be allowed")
 	}
-	if r.allow(ip) {
+	if r.allow(ip) == rateAllowed {
 		t.Fatal("third request should be rejected")
 	}
 }
@@ -395,13 +488,13 @@ func TestRateLimiterGroupsIPv6By64(t *testing.T) {
 	a := netip.MustParseAddr("2001:db8:1:2::1")
 	sameNet := netip.MustParseAddr("2001:db8:1:2:ffff::9")
 	otherNet := netip.MustParseAddr("2001:db8:1:3::1")
-	if !r.allow(a) {
+	if r.allow(a) != rateAllowed {
 		t.Fatal("first request should be allowed")
 	}
-	if r.allow(sameNet) {
+	if r.allow(sameNet) == rateAllowed {
 		t.Fatal("another address in the same /64 must share the quota")
 	}
-	if !r.allow(otherNet) {
+	if r.allow(otherNet) != rateAllowed {
 		t.Fatal("an address in a different /64 must have its own quota")
 	}
 }
@@ -438,6 +531,28 @@ func TestDoHPostNormalizesUpstreamToPOST(t *testing.T) {
 	}
 	if rec.Body.String() != string(response) {
 		t.Fatalf("response body mismatch")
+	}
+}
+
+func TestDoHRejectsDuplicateGETDNSParameters(t *testing.T) {
+	query := testQuery(30)
+	encoded := base64.RawURLEncoding.EncodeToString(query)
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?dns="+encoded+"&dns="+encoded, nil)
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDoHRejectsMalformedGETQueryString(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?dns=%zz", nil)
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
 
@@ -536,8 +651,7 @@ func TestDoHRejectsInvalidUpstreamContentType(t *testing.T) {
 func TestDoHRejectsUpstreamResponseLargerThanConfiguredLimit(t *testing.T) {
 	query := testQuery(15)
 	body := &trackingBody{}
-	u, _ := url.Parse("http://127.0.0.1:8053/dns-query")
-	s := newTestGateway(u.String())
+	s := newTestGateway("http://127.0.0.1:8053/dns-query")
 	s.maxBody = 64
 	s.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -599,6 +713,54 @@ func TestDoHRejectsMismatchedResponseID(t *testing.T) {
 	}
 }
 
+func TestDoHAcceptsCaseInsensitiveResponseQuestion(t *testing.T) {
+	query := testQuery(31)
+	response := testResponse(query)
+	qEnd, ok := parseDNSMessage(response, true)
+	if !ok {
+		t.Fatal("test response should be valid")
+	}
+	for i := 13; i < qEnd-4; i++ {
+		if response[i] >= 'a' && response[i] <= 'z' {
+			response[i] -= 'a' - 'A'
+		}
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(response)
+	}))
+	defer upstream.Close()
+
+	s := newTestGateway(upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader(string(query)))
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDoHRejectsMismatchedResponseOpcode(t *testing.T) {
+	query := testQuery(32)
+	query[2] |= 0x10 // Opcode 2 (IQUERY), which the response must preserve.
+	response := testResponse(query)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(response)
+	}))
+	defer upstream.Close()
+
+	s := newTestGateway(upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader(string(query)))
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+}
+
 func TestDoHRejectsMismatchedResponseQuestion(t *testing.T) {
 	query := testQuery(16)
 	response := testResponse(query)
@@ -644,7 +806,64 @@ func TestDoHRejectsInvalidGETQuery(t *testing.T) {
 	}
 }
 
-func TestDoHRateLimitUsesConfiguredRetryAfter(t *testing.T) {
+func TestDoHReturnsServiceUnavailableWhenClientTableIsFull(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	s.rate = newRateLimiter(99, 60, 64)
+	for i := 1; i <= 64; i++ {
+		ip := netip.AddrFrom4([4]byte{198, 18, byte(i / 256), byte(i)})
+		if got := s.rate.allow(ip); got != rateAllowed {
+			t.Fatalf("client %d decision = %v, want rateAllowed", i, got)
+		}
+	}
+
+	query := testQuery(26)
+	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader(string(query)))
+	req.RemoteAddr = "203.0.113.201:1234"
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
+	}
+}
+
+func TestDoHReturnsServiceUnavailableWhenClientAddressIsInvalid(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader(string(testQuery(29))))
+	req.RemoteAddr = "not-an-ip-address"
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
+	}
+}
+
+func TestSecondsUntilWindowReset(t *testing.T) {
+	for _, tc := range []struct {
+		unixSeconds uint64
+		windowSec   uint64
+		want        uint64
+	}{
+		{unixSeconds: 0, windowSec: 37, want: 37},
+		{unixSeconds: 1, windowSec: 37, want: 36},
+		{unixSeconds: 36, windowSec: 37, want: 1},
+		{unixSeconds: 37, windowSec: 37, want: 37},
+		{unixSeconds: 74, windowSec: 37, want: 37},
+	} {
+		if got := secondsUntilWindowReset(tc.unixSeconds, tc.windowSec); got != tc.want {
+			t.Errorf("secondsUntilWindowReset(%d, %d) = %d, want %d", tc.unixSeconds, tc.windowSec, got, tc.want)
+		}
+	}
+}
+
+func TestDoHRateLimitRetryAfterUntilWindowReset(t *testing.T) {
 	query := testQuery(6)
 	response := testResponse(query)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -673,8 +892,9 @@ func TestDoHRateLimitUsesConfiguredRetryAfter(t *testing.T) {
 	if rec2.Code != http.StatusTooManyRequests {
 		t.Fatalf("second status = %d, want 429", rec2.Code)
 	}
-	if got := rec2.Header().Get("Retry-After"); got != "37" {
-		t.Fatalf("Retry-After = %q, want 37", got)
+	retryAfter, err := strconv.ParseUint(rec2.Header().Get("Retry-After"), 10, 64)
+	if err != nil || retryAfter == 0 || retryAfter > s.rate.windowSec {
+		t.Fatalf("Retry-After = %q; want 1..%d seconds", rec2.Header().Get("Retry-After"), s.rate.windowSec)
 	}
 }
 
@@ -776,6 +996,27 @@ func TestHealthReportsUpstreamReadiness(t *testing.T) {
 	}
 }
 
+func TestHealthAndRootAllowOnlyGetAndHead(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	handlers := map[string]http.HandlerFunc{"health": s.health, "root": s.root}
+	for name, h := range handlers {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodPost, "/", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s: status = %d, want 405", name, rec.Code)
+		}
+		if got := rec.Header().Get("Allow"); got != "GET, HEAD" {
+			t.Fatalf("%s: Allow = %q, want %q", name, got, "GET, HEAD")
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	s.root(rec, httptest.NewRequest(http.MethodHead, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD /: status = %d, want 200", rec.Code)
+	}
+}
+
 func TestParseClientIPStripsIPv6Zone(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
 	r.RemoteAddr = "[fe80::1%eth0]:8080"
@@ -798,7 +1039,7 @@ func TestCleanupIntervalIsCapped(t *testing.T) {
 func TestRateLimiterCleanupRemovesExpiredEntries(t *testing.T) {
 	r := newRateLimiter(5, 60, 64)
 	ip := netip.MustParseAddr("192.0.2.30")
-	if !r.allow(ip) {
+	if r.allow(ip) != rateAllowed {
 		t.Fatal("first request should be allowed")
 	}
 	sh := &r.shards[int(addrHash(ip)%shardCount)]
@@ -808,5 +1049,30 @@ func TestRateLimiterCleanupRemovesExpiredEntries(t *testing.T) {
 	r.cleanup()
 	if got := len(sh.m); got != 0 {
 		t.Fatalf("expired entries left after cleanup = %d, want 0", got)
+	}
+}
+
+func TestParseDNSMessageReportsQuestionEnd(t *testing.T) {
+	query := testQuery(40)
+	qEnd, ok := parseDNSMessage(query, false)
+	if !ok || qEnd != len(query) {
+		t.Fatalf("parseDNSMessage = (%d, %t), want (%d, true)", qEnd, ok, len(query))
+	}
+
+	withTrailing := append(append([]byte(nil), query...), 0xff)
+	if qEnd, ok := parseDNSMessage(withTrailing, false); ok || qEnd != 0 {
+		t.Fatalf("message with trailing bytes = (%d, %t), want (0, false)", qEnd, ok)
+	}
+}
+
+func TestParseClientIPUsesFirstForwardedAddressOnlyWhenTrusted(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+	r.RemoteAddr = "127.0.0.1:8080"
+	r.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.1")
+	if got, want := parseClientIP(r, true), netip.MustParseAddr("198.51.100.7"); got != want {
+		t.Fatalf("trusted: got %s, want %s", got, want)
+	}
+	if got, want := parseClientIP(r, false), netip.MustParseAddr("127.0.0.1"); got != want {
+		t.Fatalf("untrusted: got %s, want %s", got, want)
 	}
 }

@@ -1,5 +1,6 @@
 .git
 .gitignore
+.env
 .github
 .dockerignore
 .env.example
@@ -8,3 +9,4 @@ README.md
 LICENSE
 docker-compose.yml
 *.zip
+keep-alive.txt

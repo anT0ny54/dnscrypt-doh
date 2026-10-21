@@ -27,9 +27,10 @@ import (
 )
 
 const (
-	defaultPort            = "8080"
+	defaultPort            = 8080
 	defaultDoHPath         = "/dns-query"
-	fixedUpstreamURL       = "https://127.0.0.1:8053/dns-query"
+	fixedUpstreamHost      = "127.0.0.1:8053"
+	fixedUpstreamURL       = "https://" + fixedUpstreamHost + "/dns-query"
 	defaultRateLimit       = 99
 	defaultRateWindowSec   = 60
 	defaultMaxBodyBytes    = 8192
@@ -46,8 +47,12 @@ const (
 	maxDNSNameBytes        = 255
 	maxDNSRecords          = 4096
 	dnsTypeOPT             = 41
+	dnsOpcodeMask          = 0x7800
 	shardCount             = 64
 	upstreamTimeout        = 6 * time.Second
+	requestReadTimeout     = 7 * time.Second
+	bodyReadTimeout        = 2 * time.Second
+	responseWriteTimeout   = requestReadTimeout + upstreamTimeout
 	upstreamProbeTimeout   = 500 * time.Millisecond
 	upstreamProbeCacheTTL  = 2 * time.Second
 	shutdownGrace          = 5 * time.Second
@@ -61,6 +66,15 @@ type rateEntry struct {
 	window uint64
 	count  uint32
 }
+
+type rateLimitResult uint8
+
+const (
+	rateAllowed rateLimitResult = iota
+	rateExceeded
+	rateCapacityReached
+	rateInvalidAddress
+)
 
 type rateShard struct {
 	mu sync.Mutex
@@ -85,14 +99,13 @@ func newRateLimiter(limit, windowSec, maxEntries int) *rateLimiter {
 	if maxEntries < shardCount || maxEntries > maxClientEntries {
 		maxEntries = defaultClientEntries
 	}
-	r := &rateLimiter{
+	// Shard maps are allocated lazily. A large MAX_CLIENT_IPS value should not
+	// reserve map buckets for every shard before the first client arrives.
+	return &rateLimiter{
 		limit:      uint32(limit),
 		windowSec:  uint64(windowSec),
 		maxEntries: int64(maxEntries),
 	}
-	// Allocate shard maps lazily. A large MAX_CLIENT_IPS value should not
-	// reserve map buckets for every shard before the first client arrives.
-	return r
 }
 
 func addrHash(a netip.Addr) uint64 {
@@ -108,9 +121,18 @@ func addrHash(a netip.Addr) uint64 {
 	return x ^ (x >> 31)
 }
 
-func (r *rateLimiter) allow(ip netip.Addr) bool {
+// secondsUntilWindowReset returns the number of whole seconds (1 through
+// windowSec) until the next fixed-window boundary. Keeping this tied to the
+// same timestamp used for the quota decision avoids telling clients to wait a
+// full extra window when only a small part of the current window remains.
+// windowSec is always >= 1 because newRateLimiter validates it.
+func secondsUntilWindowReset(unixSeconds, windowSec uint64) uint64 {
+	return windowSec - unixSeconds%windowSec
+}
+
+func (r *rateLimiter) allowWithRetryAfter(ip netip.Addr) (rateLimitResult, uint64) {
 	if !ip.IsValid() {
-		return false
+		return rateInvalidAddress, 0
 	}
 	// Rate-limit IPv6 clients per /64: a single subscriber normally controls
 	// a whole /64, so per-address keys would let one host mint unlimited
@@ -120,24 +142,27 @@ func (r *rateLimiter) allow(ip netip.Addr) bool {
 			ip = p.Addr()
 		}
 	}
-	nowWindow := uint64(time.Now().Unix()) / r.windowSec
 	idx := int(addrHash(ip) % shardCount)
 	sh := &r.shards[idx]
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
+	// Read the clock after acquiring the shard lock so contention across a
+	// window boundary cannot make this decision use an already-expired window.
+	nowUnix := uint64(time.Now().Unix())
+	nowWindow := nowUnix / r.windowSec
+	if sh.m == nil {
+		sh.m = make(map[netip.Addr]rateEntry)
+	}
 	entry, ok := sh.m[ip]
 	if !ok {
 		// The global entry counter is the hard capacity guard. A previous
 		// per-shard-only cap could reject a client merely because its hash
 		// bucket filled early, even when other shards still had capacity.
 		if !r.reserveEntry() {
-			return false
+			return rateCapacityReached, 0
 		}
 		entry = rateEntry{window: nowWindow}
-	}
-	if sh.m == nil {
-		sh.m = make(map[netip.Addr]rateEntry)
 	}
 
 	if entry.window != nowWindow {
@@ -145,11 +170,11 @@ func (r *rateLimiter) allow(ip netip.Addr) bool {
 		entry.count = 0
 	}
 	if entry.count >= r.limit {
-		return false
+		return rateExceeded, secondsUntilWindowReset(nowUnix, r.windowSec)
 	}
 	entry.count++
 	sh.m[ip] = entry
-	return true
+	return rateAllowed, 0
 }
 
 func (r *rateLimiter) reserveEntry() bool {
@@ -176,10 +201,13 @@ func cleanupInterval(windowSec int) time.Duration {
 }
 
 func (r *rateLimiter) cleanup() {
-	nowWindow := uint64(time.Now().Unix()) / r.windowSec
 	for i := range r.shards {
 		sh := &r.shards[i]
 		sh.mu.Lock()
+		// Read the current window while holding each shard lock. Capturing it
+		// once before the loop could let a window rollover cause cleanup to
+		// delete newly-created entries from the next window.
+		nowWindow := uint64(time.Now().Unix()) / r.windowSec
 		for k, v := range sh.m {
 			if v.window != nowWindow {
 				delete(sh.m, k)
@@ -203,14 +231,18 @@ var loopbackTLSConfig = &tls.Config{
 }
 
 type server struct {
-	client     *http.Client
-	upstream   *url.URL
-	dohPath    string
-	rate       *rateLimiter
-	sem        chan struct{}
-	maxBody    int64
-	trustProxy bool
-	started    time.Time
+	client *http.Client
+	// upstreamURL is the full DoH URL requests are POSTed to; upstreamHost is
+	// its host:port, used by the health probe. Both are stored as strings so
+	// the hot path does not re-serialize a *url.URL for every request.
+	upstreamURL  string
+	upstreamHost string
+	dohPath      string
+	rate         *rateLimiter
+	sem          chan struct{}
+	maxBody      int64
+	trustProxy   bool
+	started      time.Time
 
 	// Cached upstream probe result so health checks do not perform a fresh
 	// TCP+TLS handshake on every call.
@@ -226,9 +258,9 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-func getenvInt(key string, fallback, min, max int) int {
+func getenvInt(key string, fallback, lo, hi int) int {
 	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
-	if err != nil || v < min || v > max {
+	if err != nil || v < lo || v > hi {
 		return fallback
 	}
 	return v
@@ -266,10 +298,9 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 			}
 		}
 		if h := r.Header.Get("X-Forwarded-For"); h != "" {
-			if first := strings.TrimSpace(strings.SplitN(h, ",", 2)[0]); first != "" {
-				if ip := parse(first); ip.IsValid() {
-					return ip
-				}
+			first, _, _ := strings.Cut(h, ",")
+			if ip := parse(first); ip.IsValid() {
+				return ip
 			}
 		}
 	}
@@ -326,8 +357,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
 func isDNSMessageContentType(v string) bool {
-	return strings.EqualFold(strings.TrimSpace(strings.Split(v, ";")[0]), "application/dns-message")
+	mediaType, _, _ := strings.Cut(v, ";")
+	return strings.EqualFold(strings.TrimSpace(mediaType), "application/dns-message")
 }
 
 // dnsNameEnd validates a DNS name, including compression pointers, and returns
@@ -363,7 +399,7 @@ func dnsNameEnd(msg []byte, offset int) (int, bool) {
 			pointer := int(labelLen&0x3f)<<8 | int(msg[offset+1])
 			// DNS compression pointers must point backwards to an earlier
 			// label occurrence. A forward pointer is not a valid DNS name.
-			if pointer < 12 || pointer >= offset || pointer >= len(msg) {
+			if pointer < 12 || pointer >= offset {
 				return 0, false
 			}
 			if !jumped {
@@ -378,7 +414,7 @@ func dnsNameEnd(msg []byte, offset int) (int, bool) {
 		case labelLen&0xc0 != 0:
 			return 0, false
 		default:
-			if labelLen > 63 || offset+1+int(labelLen) > len(msg) {
+			if offset+1+int(labelLen) > len(msg) {
 				return 0, false
 			}
 			nameLen += 1 + int(labelLen)
@@ -422,41 +458,80 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 
 	// qdCount was required to be exactly one above, so parse the single
 	// question directly instead of looping over a count that cannot repeat.
-	offset := 12
-	{
-		var nameOK bool
-		if offset, nameOK = dnsNameEnd(msg, offset); !nameOK || offset+4 > len(msg) {
-			return 0, false
-		}
-		offset += 4 // QTYPE + QCLASS
+	offset, nameOK := dnsNameEnd(msg, 12)
+	if !nameOK || offset+4 > len(msg) {
+		return 0, false
 	}
+	offset += 4 // QTYPE + QCLASS
 	qEnd = offset
 
-	for i := 0; i < recordCount; i++ {
-		var nameOK bool
-		if offset, nameOK = dnsNameEnd(msg, offset); !nameOK || offset+10 > len(msg) {
-			return 0, false
-		}
-		rtype := binary.BigEndian.Uint16(msg[offset : offset+2])
-		rdataLen := int(binary.BigEndian.Uint16(msg[offset+8 : offset+10]))
-		offset += 10
-		if offset+rdataLen > len(msg) {
-			return 0, false
-		}
-		offset += rdataLen
-		if !wantResponse && rtype != dnsTypeOPT {
-			return 0, false
+	sections := [...]int{anCount, nsCount, arCount}
+	for section, sectionCount := range sections {
+		for i := 0; i < sectionCount; i++ {
+			recordStart := offset
+			if offset, nameOK = dnsNameEnd(msg, offset); !nameOK || offset+10 > len(msg) {
+				return 0, false
+			}
+			ownerEnd := offset
+			rtype := binary.BigEndian.Uint16(msg[offset : offset+2])
+			rdataLen := int(binary.BigEndian.Uint16(msg[offset+8 : offset+10]))
+			offset += 10
+			if offset+rdataLen > len(msg) {
+				return 0, false
+			}
+			offset += rdataLen
+
+			if !wantResponse && rtype != dnsTypeOPT {
+				return 0, false
+			}
+			if rtype == dnsTypeOPT {
+				// EDNS permits a root-owned OPT pseudo-record only as the final
+				// record in the additional section. This also rejects duplicates:
+				// an earlier OPT cannot be final when another record follows.
+				if section != 2 || i != sectionCount-1 || ownerEnd != recordStart+1 || msg[recordStart] != 0 {
+					return 0, false
+				}
+			}
 		}
 	}
 
-	return qEnd, offset == len(msg)
+	// Trailing bytes after the last record are invalid; keep the documented
+	// contract that qEnd is 0 on every failure path.
+	if offset != len(msg) {
+		return 0, false
+	}
+	return qEnd, true
+}
+
+// dnsQuestionEqual compares validated question sections. DNS names are
+// case-insensitive ASCII labels, while QTYPE and QCLASS must match exactly.
+// The parser guarantees that the question names are valid and uncompressed.
+func dnsQuestionEqual(a []byte, aEnd int, b []byte, bEnd int) bool {
+	if aEnd < 17 || aEnd != bEnd || aEnd > len(a) || bEnd > len(b) {
+		return false
+	}
+	aNameEnd, bNameEnd := aEnd-4, bEnd-4
+	for i := 12; i < aNameEnd; i++ {
+		x, y := a[i], b[i]
+		if x >= 'A' && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if y >= 'A' && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return bytes.Equal(a[aNameEnd:aEnd], b[bNameEnd:bEnd])
 }
 
 // readDNSQuery extracts and validates the DNS wire message from a DoH
 // request, returning the message along with qEnd, the offset just past its
 // question section, so the caller can compare question sections without a
 // second parse. The status return is a non-zero HTTP status code on failure.
-func readDNSQuery(r *http.Request, maxBody int64) (msg []byte, qEnd int, status int) {
+func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int, int) {
+	var msg []byte
 	if r.Method == http.MethodPost {
 		if !isDNSMessageContentType(r.Header.Get("Content-Type")) {
 			return nil, 0, http.StatusUnsupportedMediaType
@@ -471,33 +546,36 @@ func readDNSQuery(r *http.Request, maxBody int64) (msg []byte, qEnd int, status 
 		if int64(len(body)) > maxBody {
 			return nil, 0, http.StatusRequestEntityTooLarge
 		}
-		qEnd, ok := parseDNSMessage(body, false)
-		if !ok {
+		msg = body
+	} else {
+		values, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
 			return nil, 0, http.StatusBadRequest
 		}
-		return body, qEnd, 0
+		dnsValues, ok := values["dns"]
+		if !ok || len(dnsValues) != 1 || dnsValues[0] == "" {
+			return nil, 0, http.StatusBadRequest
+		}
+		encoded := dnsValues[0]
+		maxEncoded := base64.RawURLEncoding.EncodedLen(int(maxBody))
+		if len(encoded) > maxEncoded || len(encoded) > defaultMaxGetQuerySize {
+			return nil, 0, http.StatusRequestURITooLong
+		}
+		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, 0, http.StatusBadRequest
+		}
+		if int64(len(decoded)) > maxBody {
+			return nil, 0, http.StatusRequestEntityTooLarge
+		}
+		msg = decoded
 	}
 
-	encoded := r.URL.Query().Get("dns")
-	if encoded == "" {
-		return nil, 0, http.StatusBadRequest
-	}
-	maxEncoded := base64.RawURLEncoding.EncodedLen(int(maxBody))
-	if len(encoded) > maxEncoded || len(encoded) > defaultMaxGetQuerySize {
-		return nil, 0, http.StatusRequestURITooLong
-	}
-	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		return nil, 0, http.StatusBadRequest
-	}
-	if int64(len(decoded)) > maxBody {
-		return nil, 0, http.StatusRequestEntityTooLarge
-	}
-	qEnd, ok := parseDNSMessage(decoded, false)
+	qEnd, ok := parseDNSMessage(msg, false)
 	if !ok {
 		return nil, 0, http.StatusBadRequest
 	}
-	return decoded, qEnd, 0
+	return msg, qEnd, 0
 }
 
 // upstreamReady reports whether the fixed loopback DoH upstream accepts TLS
@@ -525,7 +603,7 @@ func (s *server) probeUpstream() bool {
 	d := &net.Dialer{Timeout: upstreamProbeTimeout}
 	// The probe shares the transport's read-only loopbackTLSConfig instead
 	// of allocating a fresh tls.Config for every probe.
-	conn, err := tls.DialWithDialer(d, "tcp", s.upstream.Host, loopbackTLSConfig)
+	conn, err := tls.DialWithDialer(d, "tcp", s.upstreamHost, loopbackTLSConfig)
 	if err != nil {
 		return false
 	}
@@ -533,10 +611,20 @@ func (s *server) probeUpstream() bool {
 	return true
 }
 
+// allowGetOrHead reports whether the request method is GET or HEAD. For any
+// other method it writes a 405 response with an Allow header and returns
+// false, so the read-only /health and / handlers share one guard.
+func allowGetOrHead(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return true
+	}
+	w.Header().Set("Allow", "GET, HEAD")
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	return false
+}
+
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !allowGetOrHead(w, r) {
 		return
 	}
 	status, state := http.StatusOK, "ok"
@@ -551,9 +639,7 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) root(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !allowGetOrHead(w, r) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -581,38 +667,58 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		defer func() { <-s.sem }()
 	default:
 		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server concurrency limit reached"})
+		writeError(w, http.StatusServiceUnavailable, "server concurrency limit reached")
 		return
 	}
 
 	ip := parseClientIP(r, s.trustProxy)
-	if !s.rate.allow(ip) {
-		w.Header().Set("Retry-After", strconv.FormatUint(s.rate.windowSec, 10))
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
+	rateDecision, retryAfter := s.rate.allowWithRetryAfter(ip)
+	switch rateDecision {
+	case rateAllowed:
+		// Continue with request validation and forwarding.
+	case rateExceeded:
+		w.Header().Set("Retry-After", strconv.FormatUint(retryAfter, 10))
+		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
+	case rateCapacityReached:
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "client tracking capacity reached")
+		return
+	default:
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "client IP address unavailable")
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		// The concurrency slot is already held, so a client trickling its body
+		// would pin it for the full ReadTimeout. A DNS message is at most a few
+		// KiB; bound the body read tightly. Best effort: the error is ignored
+		// for ResponseWriters that do not support read deadlines.
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
 	}
 
 	query, qEnd, status := readDNSQuery(r, s.maxBody)
 	if status != 0 {
+		msg := "invalid DNS query"
 		switch status {
 		case http.StatusUnsupportedMediaType:
-			writeJSON(w, status, map[string]string{"error": "Content-Type must be application/dns-message"})
+			msg = "Content-Type must be application/dns-message"
 		case http.StatusRequestEntityTooLarge:
-			writeJSON(w, status, map[string]string{"error": "DNS message exceeds configured size limit"})
+			msg = "DNS message exceeds configured size limit"
 		case http.StatusRequestURITooLong:
-			writeJSON(w, status, map[string]string{"error": "dns query parameter too large"})
-		default:
-			writeJSON(w, status, map[string]string{"error": "invalid DNS query"})
+			msg = "dns query parameter too large"
 		}
+		writeError(w, status, msg)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), upstreamTimeout)
 	defer cancel()
 
-	uReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.upstream.String(), bytes.NewReader(query))
+	uReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.upstreamURL, bytes.NewReader(query))
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "dns upstream unavailable"})
+		writeError(w, http.StatusBadGateway, "dns upstream unavailable")
 		return
 	}
 	uReq.Header.Set("Accept", "application/dns-message")
@@ -621,25 +727,25 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.client.Do(uReq)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "dns upstream timeout"})
+			writeError(w, http.StatusGatewayTimeout, "dns upstream timeout")
 			return
 		}
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "dns upstream unavailable"})
+		writeError(w, http.StatusBadGateway, "dns upstream unavailable")
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, s.maxBody+1))
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "dns upstream returned an invalid HTTP status"})
+		writeError(w, http.StatusBadGateway, "dns upstream returned an invalid HTTP status")
 		return
 	}
 	if !isDNSMessageContentType(resp.Header.Get("Content-Type")) {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "dns upstream returned an invalid content type"})
+		writeError(w, http.StatusBadGateway, "dns upstream returned an invalid content type")
 		return
 	}
 	if resp.ContentLength > s.maxBody {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "dns upstream response exceeds configured size limit"})
+		writeError(w, http.StatusBadGateway, "dns upstream response exceeds configured size limit")
 		return
 	}
 
@@ -647,14 +753,14 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// The per-request deadline also covers the body read.
 		if errors.Is(err, context.DeadlineExceeded) {
-			writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "dns upstream timeout"})
+			writeError(w, http.StatusGatewayTimeout, "dns upstream timeout")
 			return
 		}
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
+		writeError(w, http.StatusBadGateway, "invalid DNS response from upstream")
 		return
 	}
 	if int64(len(body)) > s.maxBody {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
+		writeError(w, http.StatusBadGateway, "invalid DNS response from upstream")
 		return
 	}
 	// parseDNSMessage validates the response and returns the offset just past
@@ -662,17 +768,23 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	// parse of either message.
 	respQEnd, ok := parseDNSMessage(body, true)
 	if !ok {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid DNS response from upstream"})
+		writeError(w, http.StatusBadGateway, "invalid DNS response from upstream")
 		return
 	}
 	// Both messages passed parseDNSMessage, so each is at least 12 bytes and
 	// qEnd/respQEnd mark the end of each question section.
-	if binary.BigEndian.Uint16(body[:2]) != binary.BigEndian.Uint16(query[:2]) {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "DNS response ID mismatch"})
+	if !bytes.Equal(body[:2], query[:2]) {
+		writeError(w, http.StatusBadGateway, "DNS response ID mismatch")
 		return
 	}
-	if !bytes.Equal(query[12:qEnd], body[12:respQEnd]) {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "DNS response question mismatch"})
+	queryFlags := binary.BigEndian.Uint16(query[2:4])
+	responseFlags := binary.BigEndian.Uint16(body[2:4])
+	if queryFlags&dnsOpcodeMask != responseFlags&dnsOpcodeMask {
+		writeError(w, http.StatusBadGateway, "DNS response opcode mismatch")
+		return
+	}
+	if !dnsQuestionEqual(query, qEnd, body, respQEnd) {
+		writeError(w, http.StatusBadGateway, "DNS response question mismatch")
 		return
 	}
 
@@ -684,7 +796,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	port := getenv("PORT", defaultPort)
+	port := strconv.Itoa(getenvInt("PORT", defaultPort, 1, 65535))
 	dohPath := getenv("DOH_PATH", defaultDoHPath)
 	rateLimit := getenvInt("RATE_LIMIT", defaultRateLimit, 1, maxRateLimit)
 	rateWindow := getenvInt("RATE_WINDOW_SECONDS", defaultRateWindowSec, 1, maxRateWindowSec)
@@ -700,17 +812,13 @@ func main() {
 		log.Fatalf("invalid DOH_PATH: %v", err)
 	}
 
-	upstream, err := url.Parse(fixedUpstreamURL)
-	if err != nil {
-		log.Fatalf("invalid fixed DoH upstream: %v", err)
-	}
-
 	// The upstream deadline is owned by the per-request context created in
 	// doh (upstreamTimeout). Do not also set http.Client.Timeout or
 	// ResponseHeaderTimeout here, or partial timeout behavior becomes hard to
 	// reason about.
 	transport := &http.Transport{
-		Proxy:               nil,
+		// No Proxy: the loopback upstream must never go through an
+		// environment-configured proxy.
 		TLSClientConfig:     loopbackTLSConfig,
 		MaxIdleConns:        concLimit,
 		MaxIdleConnsPerHost: concLimit,
@@ -728,13 +836,14 @@ func main() {
 				return http.ErrUseLastResponse
 			},
 		},
-		upstream:   upstream,
-		dohPath:    dohPath,
-		rate:       newRateLimiter(rateLimit, rateWindow, maxClients),
-		sem:        make(chan struct{}, concLimit),
-		maxBody:    int64(maxBody),
-		trustProxy: trustProxy,
-		started:    time.Now(),
+		upstreamURL:  fixedUpstreamURL,
+		upstreamHost: fixedUpstreamHost,
+		dohPath:      dohPath,
+		rate:         newRateLimiter(rateLimit, rateWindow, maxClients),
+		sem:          make(chan struct{}, concLimit),
+		maxBody:      int64(maxBody),
+		trustProxy:   trustProxy,
+		started:      time.Now(),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -770,23 +879,27 @@ func main() {
 	h := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 2 * time.Second,
-		ReadTimeout:       7 * time.Second,
-		WriteTimeout:      7 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    defaultMaxHeaderBytes,
+		ReadTimeout:       requestReadTimeout,
+		// WriteTimeout starts after request headers are read and continues
+		// while the body is read and the upstream response is produced. Leave
+		// enough budget for a full request-read interval plus the upstream
+		// deadline, rather than silently truncating slow valid requests early.
+		WriteTimeout:   responseWriteTimeout,
+		IdleTimeout:    30 * time.Second,
+		MaxHeaderBytes: defaultMaxHeaderBytes,
 	}
 
 	// Bind before announcing startup so an invalid or occupied port is
 	// reported here instead of racing with a signal in the goroutine below.
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		log.Fatalf("listen on 0.0.0.0:%s: %v", port, err)
+		log.Fatalf("listen on :%s: %v", port, err)
 	}
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- h.Serve(listener)
 	}()
-	log.Printf("DoH gateway listening on 0.0.0.0:%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
+	log.Printf("DoH gateway listening on :%s path=%s upstream=%s rate=%d/%ds maxClients=%d maxConcurrency=%d maxBody=%d trustProxy=%t",
 		port, dohPath, fixedUpstreamURL, rateLimit, rateWindow, maxClients, concLimit, maxBody, trustProxy)
 
 	select {
