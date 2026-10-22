@@ -249,6 +249,7 @@ type server struct {
 	rate         *rateLimiter
 	sem          chan struct{}
 	maxBody      int64
+	maxEncoded   int
 	trustProxy   bool
 	started      time.Time
 
@@ -288,37 +289,39 @@ func getenvBool(key string, fallback bool) bool {
 	}
 }
 
-func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
-	parse := func(value string) netip.Addr {
-		ip, err := netip.ParseAddr(strings.TrimSpace(value))
-		if err != nil {
-			return netip.Addr{}
-		}
-		// Strip IPv6 zone identifiers so they cannot be used to mint
-		// additional rate-limit identities for the same address.
-		return ip.Unmap().WithZone("")
+// parseClientIPValue parses a single header or RemoteAddr value into a
+// canonical client IP. IPv6 zone identifiers are stripped so they cannot be
+// used to mint additional rate-limit identities for the same address. It is a
+// package-level function (not a per-request closure) because it captures
+// nothing.
+func parseClientIPValue(value string) (netip.Addr, bool) {
+	ip, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil {
+		return netip.Addr{}, false
 	}
+	return ip.Unmap().WithZone(""), true
+}
 
+func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 	if trustProxy {
-		if h := r.Header.Get("CF-Connecting-IP"); h != "" {
-			if ip := parse(h); ip.IsValid() {
-				return ip
-			}
+		if ip, ok := parseClientIPValue(r.Header.Get("CF-Connecting-IP")); ok {
+			return ip
 		}
 		if h := r.Header.Get("X-Forwarded-For"); h != "" {
 			first, _, _ := strings.Cut(h, ",")
-			if ip := parse(first); ip.IsValid() {
+			if ip, ok := parseClientIPValue(first); ok {
 				return ip
 			}
 		}
 	}
 
 	if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil {
-		if ip := parse(host); ip.IsValid() {
+		if ip, ok := parseClientIPValue(host); ok {
 			return ip
 		}
 	}
-	return parse(r.RemoteAddr)
+	ip, _ := parseClientIPValue(r.RemoteAddr)
+	return ip
 }
 
 // validateDoHPath rejects paths that cannot be reached by http.ServeMux and
@@ -470,6 +473,20 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 	if !nameOK || offset+4 > len(msg) {
 		return 0, false
 	}
+	// The question name must be uncompressed: compression pointers are only
+	// valid inside resource records. Today any pointer here would still be
+	// rejected indirectly (a question pointer can only target bytes inside
+	// the name being parsed, which the jump cap above rejects as a loop), but
+	// enforcing it explicitly documents the invariant dnsQuestionEqual relies
+	// on and avoids that 128-step loop. A 0xc0 byte inside this span is
+	// necessarily a pointer: dnsNameEnd already rejected 0x40/0x80 label
+	// lengths, and a pointer that starts the jump still lies in this span
+	// because dnsNameEnd returns the offset just past it.
+	for i := 12; i < offset; i++ {
+		if msg[i]&0xc0 == 0xc0 {
+			return 0, false
+		}
+	}
 	offset += 4 // QTYPE + QCLASS
 	qEnd = offset
 
@@ -526,7 +543,12 @@ func dnsQuestionEqual(a []byte, aEnd int, b []byte, bEnd int) bool {
 		return false
 	}
 	// aEnd == bEnd was verified above, so both name sections share one end
-	// offset; a single index serves both messages.
+	// offset; a single index serves both messages. The overwhelmingly common
+	// case is a byte-identical echo; skip the fold-compare loop when it
+	// already matches.
+	if bytes.Equal(a[12:aEnd], b[12:bEnd]) {
+		return true
+	}
 	nameEnd := aEnd - 4
 	for i := 12; i < nameEnd; i++ {
 		x, y := a[i], b[i]
@@ -546,8 +568,11 @@ func dnsQuestionEqual(a []byte, aEnd int, b []byte, bEnd int) bool {
 // readDNSQuery extracts and validates the DNS wire message from a DoH
 // request, returning the message along with qEnd, the offset just past its
 // question section, so the caller can compare question sections without a
-// second parse. The status return is a non-zero HTTP status code on failure.
-func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int, int) {
+// second parse. maxEncoded is the base64url-encoded ceiling derived from
+// MAX_DNS_MESSAGE_BYTES; the absolute defaultMaxGetQuerySize ceiling is
+// applied independently. The status return is a non-zero HTTP status code on
+// failure.
+func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, int) {
 	var msg []byte
 	if r.Method == http.MethodPost {
 		if !isDNSMessageContentType(r.Header.Get("Content-Type")) {
@@ -565,6 +590,14 @@ func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int, int) {
 		}
 		msg = body
 	} else {
+		// Fail fast: a query string longer than the absolute encoded ceiling
+		// plus the shortest possible "dns=" prefix cannot yield an acceptable
+		// dns parameter, so reject it before parsing. (The request line is
+		// already bounded by the server's MaxHeaderBytes; this only skips
+		// parse work on requests that cannot succeed.)
+		if len(r.URL.RawQuery) > defaultMaxGetQuerySize+len("dns=") {
+			return nil, 0, http.StatusRequestURITooLong
+		}
 		values, err := url.ParseQuery(r.URL.RawQuery)
 		if err != nil {
 			return nil, 0, http.StatusBadRequest
@@ -574,7 +607,6 @@ func readDNSQuery(r *http.Request, maxBody int64) ([]byte, int, int) {
 			return nil, 0, http.StatusBadRequest
 		}
 		encoded := dnsValues[0]
-		maxEncoded := base64.RawURLEncoding.EncodedLen(int(maxBody))
 		if len(encoded) > maxEncoded || len(encoded) > defaultMaxGetQuerySize {
 			return nil, 0, http.StatusRequestURITooLong
 		}
@@ -619,9 +651,25 @@ func (s *server) upstreamReady() bool {
 func (s *server) probeUpstream() bool {
 	// The probe shares the transport's read-only loopbackTLSConfig and the
 	// package-level probeDialer instead of allocating a fresh tls.Config and
-	// net.Dialer for every probe.
-	conn, err := tls.DialWithDialer(probeDialer, "tcp", s.upstreamHost, loopbackTLSConfig)
+	// net.Dialer for every probe. tls.DialWithDialer is deliberately NOT used:
+	// it would give the TCP dial and TLS handshake separate timeout windows.
+	// One deadline is fixed before dialing and carried through the handshake,
+	// matching the documented total 500 ms probe budget.
+	deadline := time.Now().Add(upstreamProbeTimeout)
+	rawConn, err := probeDialer.Dial("tcp", s.upstreamHost)
 	if err != nil {
+		return false
+	}
+	if err := rawConn.SetDeadline(deadline); err != nil {
+		_ = rawConn.Close()
+		return false
+	}
+	conn := tls.Client(rawConn, loopbackTLSConfig)
+	if err := conn.Handshake(); err != nil {
+		// Close the TLS connection itself, not the raw conn: tls.Conn.Close
+		// closes the underlying connection too and keeps the close path in
+		// one layer.
+		_ = conn.Close()
 		return false
 	}
 	_ = conn.Close()
@@ -666,6 +714,13 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// unavailableRetryAfter1 answers 503 with a one-second Retry-After hint. The
+// client-table-capacity and invalid-client-IP paths share this response.
+func unavailableRetryAfter1(w http.ResponseWriter, msg string) {
+	w.Header().Set("Retry-After", "1")
+	writeError(w, http.StatusServiceUnavailable, msg)
+}
+
 // doh handles requests for the configured DoH path only; the root mux wrapper
 // dispatches matching paths here, and validateDoHPath keeps the reserved
 // /health and / paths free, so no additional path check is needed inside the
@@ -699,12 +754,10 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	case rateCapacityReached:
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusServiceUnavailable, "client tracking capacity reached")
+		unavailableRetryAfter1(w, "client tracking capacity reached")
 		return
 	case rateInvalidAddress:
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusServiceUnavailable, "client IP address unavailable")
+		unavailableRetryAfter1(w, "client IP address unavailable")
 		return
 	}
 
@@ -716,7 +769,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
 	}
 
-	query, qEnd, status := readDNSQuery(r, s.maxBody)
+	query, qEnd, status := readDNSQuery(r, s.maxBody, s.maxEncoded)
 	if status != 0 {
 		msg := "invalid DNS query"
 		switch status {
@@ -873,6 +926,7 @@ func main() {
 		rate:         newRateLimiter(rateLimit, rateWindow, maxClients),
 		sem:          make(chan struct{}, concLimit),
 		maxBody:      int64(maxBody),
+		maxEncoded:   base64.RawURLEncoding.EncodedLen(maxBody),
 		trustProxy:   trustProxy,
 		started:      time.Now(),
 	}

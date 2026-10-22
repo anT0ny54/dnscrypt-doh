@@ -40,7 +40,8 @@ SnapDeploy supplies the public TLS certificate and routes HTTP to the container 
 
 ## Process supervision
 
-The container runs [tini](https://github.com/krallin/tini) as PID 1 for signal forwarding and PID-1 reaping duties. The entrypoint shell remains the direct parent of dnscrypt-proxy and the gateway, reaps them with `wait`, and uses `kill -0` liveness checks.
+The container runs [tini](https://github.com/krallin/tini) as PID 1 for signal forwarding and PID-1 reaping duties. The entrypoint shell remains the direct parent of dnscrypt-proxy and the gateway and blocks in `wait -n` so a service exit is reaped and detected immediately. `kill -0` polling is not used for liveness: on shells that do not opportunistically reap background jobs, an unreaped child stays a zombie that `kill -0` still reports as alive, so a crashed service would otherwise go undetected.
+Signal and exit traps are installed before configuration validation and service startup, so a stop signal during the startup window still drains the gateway before the resolver is stopped.
 
 `entrypoint.sh`:
 
@@ -123,6 +124,7 @@ Any other path returns 404 with a JSON error body, consistent with every other e
 
 - `POST` requires `Content-Type: application/dns-message` and a body no larger than `MAX_DNS_MESSAGE_BYTES`.
 - `GET` requires exactly one RFC 8484 `dns` parameter containing raw URL-safe base64 without padding. Duplicate `dns` parameters and malformed query strings are rejected. The encoded parameter is hard-capped at 12,288 characters, which caps the decoded message at 9,216 bytes; with the default `MAX_DNS_MESSAGE_BYTES=8192` the binding limit is 10,923 characters (`base64.RawURLEncoding.EncodedLen(8192)`). `MAX_DNS_MESSAGE_BYTES` values above 9,216 therefore only take effect for `POST`.
+- Query strings longer than the encoded ceiling plus a `dns=` prefix are rejected with 414 before parsing, so oversized requests cost no query-string parse work.
 - Requests are validated as DNS wire format before forwarding: exactly one question, no answer or authority records, at most one root-owned EDNS OPT record, last in the additional section, no trailing bytes, 255-byte name limit, strict backward compression pointers, and a 4096-record ceiling. Upstream responses also reject duplicate, misplaced, or non-final OPT records.
 - Upstream responses must be valid DNS responses with matching ID, opcode, and question. DNS question names are compared case-insensitively as required by DNS name semantics; QTYPE and QCLASS must match exactly.
 - Upstream errors return 502; upstream timeouts return 504; the upstream deadline is 6 seconds and covers response-body reads.
@@ -155,6 +157,14 @@ The gateway binds its socket before announcing startup, validates the configured
 
 ## Local build and run
 
+Run the gateway test suite and vet checks before building (the Dockerfile
+refuses to produce an image when either fails):
+
+```bash
+go test ./...
+go vet ./...
+```
+
 ```bash
 docker compose up --build
 ```
@@ -171,7 +181,7 @@ The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy ar
 
 ## Testing
 
-The gateway ships a comprehensive test suite (`main_test.go`) covering DNS wire-format validation (single question, single root-owned OPT record, 255-byte names, backward-only compression pointers, 4,096-record ceiling), rate limiting (IPv6 /64 grouping, global capacity and correct 429/503 status handling, cleanup), proxy-header parsing, path validation, request routing (including the JSON 404), upstream error handling, health-check caching, and 405 handling on `/health` and `/`. The Docker build refuses to produce an image if `go test` or `go vet` fails.
+The gateway ships a comprehensive test suite (`main_test.go`) covering DNS wire-format validation (single question, single root-owned OPT record, 255-byte names, backward-only compression pointers in records, uncompressed question names, 4,096-record ceiling), rate limiting (IPv6 /64 grouping, global capacity and correct 429/503 status handling, cleanup), proxy-header parsing, path validation, request routing (including the JSON 404), upstream response ID/opcode/question matching, upstream error handling, health-check caching and probe-deadline bounding, and 405 handling on `/health` and `/`. The Docker build refuses to produce an image if `go test` or `go vet` fails.
 
 ## Repository keep-alive
 
@@ -181,7 +191,11 @@ The gateway ships a comprehensive test suite (`main_test.go`) covering DNS wire-
 
 See [`CHANGELOG.md`](CHANGELOG.md).
 
-## 🌐 Free DNS Services
+## 🔗 Related projects (not part of this repository)
+
+The services below are maintained separately and are **not** part of this repository, its build pipeline, or its release cycle. They are listed here for convenience only.
+
+### 🌐 Free DNS Services
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
@@ -194,7 +208,7 @@ High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 | Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
 | Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
 
-## ⚡ Bandwidth Hero Server
+### ⚡ Bandwidth Hero Server
 
 A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
 

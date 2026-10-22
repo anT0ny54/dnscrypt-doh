@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -108,6 +109,7 @@ func newTestGateway(upstream string) *server {
 		rate:         newRateLimiter(99, 60, 256),
 		sem:          make(chan struct{}, 2),
 		maxBody:      defaultMaxBodyBytes,
+		maxEncoded:   base64.RawURLEncoding.EncodedLen(defaultMaxBodyBytes),
 		trustProxy:   false,
 		started:      time.Now(),
 	}
@@ -150,6 +152,17 @@ func TestValidDNSMessageRejectsForwardCompressionPointer(t *testing.T) {
 	query := queryWithQName(10, qname)
 	if validDNSMessage(query, false) {
 		t.Fatal("expected forward compression pointer to be rejected")
+	}
+}
+
+func TestValidDNSMessageRejectsCompressedQuestionName(t *testing.T) {
+	// A backward pointer inside the question section is invalid: compression
+	// is only permitted inside resource records. This is rejected explicitly
+	// (and, before that, only indirectly via the pointer jump cap).
+	qname := []byte{0x01, 'x', 0xc0, 0x0c}
+	query := queryWithQName(17, qname)
+	if validDNSMessage(query, false) {
+		t.Fatal("expected compressed question name to be rejected")
 	}
 }
 
@@ -565,6 +578,21 @@ func TestDoHRejectsDuplicateGETDNSParameters(t *testing.T) {
 	}
 }
 
+func TestDoHRejectsOversizedRawQueryBeforeParsing(t *testing.T) {
+	// A query string longer than the encoded ceiling plus a "dns=" prefix is
+	// rejected with 414 before parsing. Without the fast-fail it would parse
+	// fine (one giant valueless parameter) and fail later as a 400, but the
+	// gateway must not spend parse work on a request that cannot succeed.
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	long := strings.Repeat("a", defaultMaxGetQuerySize+len("dns=")+1)
+	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?"+long, nil)
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusRequestURITooLong {
+		t.Fatalf("status = %d, want 414", rec.Code)
+	}
+}
+
 func TestDoHRejectsMalformedGETQueryString(t *testing.T) {
 	s := newTestGateway("http://127.0.0.1:9/dns-query")
 	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?dns=%zz", nil)
@@ -764,6 +792,11 @@ func TestDoHRejectsMismatchedResponseOpcode(t *testing.T) {
 	query := testQuery(32)
 	query[2] |= 0x10 // Opcode 2 (IQUERY), which the response must preserve.
 	response := testResponse(query)
+
+	// testResponse copies the query opcode. Clear the response opcode so this
+	// test exercises the gateway's opcode-mismatch branch instead of expecting
+	// a mismatch for a response that matches.
+	response[2] &^= byte(dnsOpcodeMask >> 8)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
 		_, _ = w.Write(response)
@@ -1118,5 +1151,32 @@ func TestRouteDispatchesPathsAndReturnsJSON404(t *testing.T) {
 	s.route(rec, httptest.NewRequest(http.MethodPut, defaultDoHPath, nil))
 	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET, POST" {
 		t.Fatalf("DoH path dispatch: status=%d Allow=%q, want 405 and %q", rec.Code, rec.Header().Get("Allow"), "GET, POST")
+	}
+}
+
+func TestProbeUpstreamBoundedByDeadline(t *testing.T) {
+	// An endpoint that accepts TCP but never speaks TLS must fail the probe
+	// within the probe timeout; before the handshake deadline existed, the
+	// probe hung until the peer eventually closed the connection.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			time.Sleep(2 * time.Second)
+			_ = c.Close()
+		}
+	}()
+
+	s := &server{upstreamHost: ln.Addr().String()}
+	start := time.Now()
+	if s.probeUpstream() {
+		t.Fatal("probe should fail against a non-speaking TCP endpoint")
+	}
+	if elapsed := time.Since(start); elapsed > upstreamProbeTimeout+500*time.Millisecond {
+		t.Fatalf("probe took %s, want it bounded by the %s probe timeout", elapsed, upstreamProbeTimeout)
 	}
 }

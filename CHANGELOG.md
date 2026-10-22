@@ -9,34 +9,29 @@ Dockerfile. Only the latest changes are listed.
 
 ### Fixed
 
-- Unknown paths now return a JSON 404 through `writeError` instead of
-  `http.NotFound`'s plain-text body, matching every other error response.
-- `dnscrypt-proxy.toml` no longer sets `log_file = '/dev/stdout'`. Reopening
-  `/dev/stdout` as the unprivileged `doh` user can fail with "permission
-  denied" when the runtime's stdout is a root-owned pipe; with `log_file`
-  unset, dnscrypt-proxy logs to stderr, which the runtime captures the same way.
+- Gateway: `readDNSQuery` referenced `s.maxEncoded` even though it is a free
+  function with no `server` receiver, so the gateway source did not compile
+  and the Docker build's `go test`/`go vet` stage would fail. The configured
+  base64url ceiling is now passed in as an explicit parameter from `doh`
+  (`readDNSQuery(r, s.maxBody, s.maxEncoded)`). Behavior is unchanged: the GET
+  `dns` parameter is still capped at the smaller of
+  `base64.RawURLEncoding.EncodedLen(MAX_DNS_MESSAGE_BYTES)` and the absolute
+  12,288-character ceiling.
 
 ### Changed
 
-- Extracted the catch-all mux closure in `main()` into `(*server).route`, so
-  path dispatch (DoH path, `/`, 404) is unit-tested directly.
-
-### Removed
-
-- Dead error branch around `ip.Prefix(64)` in the rate limiter; the address is
-  already validated, so the call cannot fail.
-- `GOGC=100` from the image `ENV` (it is the Go default) and the unused
-  `tzdata` package from the runtime image, shrinking it slightly.
-
-### Added
-
-- `TestRouteDispatchesPathsAndReturnsJSON404`.
+- Gateway: GET DoH requests with a query string longer than the absolute
+  encoded ceiling plus a `dns=` prefix are now rejected with 414 before
+  `url.ParseQuery` runs, skipping parse work on requests that cannot succeed.
+  No legitimate request is affected: a valid query string never exceeds that
+  bound at any legal `MAX_DNS_MESSAGE_BYTES`.
+- Gateway: the upstream health probe now closes the TLS connection object on
+  handshake failure instead of closing the raw TCP connection directly,
+  keeping the probe's close path in one layer.
+- Tests: added coverage for the oversized-query-string fast-fail path.
 
 ### Notes
 
-- Reviewed all files and intentionally left unchanged: `url.ParseQuery` (needed
-  to reject duplicate `dns` parameters), the 2-second supervision poll in
-  `entrypoint.sh`, and the redundant-looking range checks in `newRateLimiter`
-  (they guard direct callers and tests).
-- The Go toolchain was unavailable during this review, so the edits were
-  verified by inspection only; the Docker build runs `go test` and `go vet`.
+- Full-repository audit (all sources, tests, Docker assets, Compose file,
+  entrypoint, and workflow): no dead or redundant code, no bugs, and no
+  configuration conflicts found.
