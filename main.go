@@ -137,10 +137,10 @@ func (r *rateLimiter) allowWithRetryAfter(ip netip.Addr) (rateLimitResult, uint6
 	// Rate-limit IPv6 clients per /64: a single subscriber normally controls
 	// a whole /64, so per-address keys would let one host mint unlimited
 	// identities and bypass the per-client quota.
+	// ip is valid here, so Prefix(64) cannot fail.
 	if ip.Is6() {
-		if p, err := ip.Prefix(64); err == nil {
-			ip = p.Addr()
-		}
+		p, _ := ip.Prefix(64)
+		ip = p.Addr()
 	}
 	idx := int(addrHash(ip) % shardCount)
 	sh := &r.shards[idx]
@@ -209,7 +209,11 @@ func (r *rateLimiter) cleanup() {
 		// delete newly-created entries from the next window.
 		nowWindow := uint64(time.Now().Unix()) / r.windowSec
 		for k, v := range sh.m {
-			if v.window != nowWindow {
+			// Only expired windows may be reclaimed. A window ahead of
+			// nowWindow means the clock moved backwards after the entry was
+			// stored; evicting it would free a slot that the client's next
+			// request immediately re-creates anyway.
+			if v.window < nowWindow {
 				delete(sh.m, k)
 				r.entries.Add(-1)
 			}
@@ -229,6 +233,10 @@ var loopbackTLSConfig = &tls.Config{
 	InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
 	MinVersion:         tls.VersionTLS12,
 }
+
+// probeDialer is shared by all upstream health probes. A net.Dialer is safe
+// for concurrent use, so probes do not need to allocate their own copy.
+var probeDialer = &net.Dialer{Timeout: upstreamProbeTimeout}
 
 type server struct {
 	client *http.Client
@@ -488,7 +496,11 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 				// EDNS permits a root-owned OPT pseudo-record only as the final
 				// record in the additional section. This also rejects duplicates:
 				// an earlier OPT cannot be final when another record follows.
-				if section != 2 || i != sectionCount-1 || ownerEnd != recordStart+1 || msg[recordStart] != 0 {
+				// A validated owner name of exactly one byte is necessarily the
+				// root label (0x00): regular labels and compression pointers
+				// each need at least two bytes, so an explicit zero-byte test
+				// would be unreachable.
+				if section != 2 || i != sectionCount-1 || ownerEnd != recordStart+1 {
 					return 0, false
 				}
 			}
@@ -505,13 +517,18 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 
 // dnsQuestionEqual compares validated question sections. DNS names are
 // case-insensitive ASCII labels, while QTYPE and QCLASS must match exactly.
-// The parser guarantees that the question names are valid and uncompressed.
+// The parser guarantees that the question names are valid and uncompressed,
+// and both end offsets come from parseDNSMessage, which already ensures
+// aEnd >= 17 and that each offset is within its message; only the equality
+// of the two ends needs to be checked here.
 func dnsQuestionEqual(a []byte, aEnd int, b []byte, bEnd int) bool {
-	if aEnd < 17 || aEnd != bEnd || aEnd > len(a) || bEnd > len(b) {
+	if aEnd != bEnd {
 		return false
 	}
-	aNameEnd, bNameEnd := aEnd-4, bEnd-4
-	for i := 12; i < aNameEnd; i++ {
+	// aEnd == bEnd was verified above, so both name sections share one end
+	// offset; a single index serves both messages.
+	nameEnd := aEnd - 4
+	for i := 12; i < nameEnd; i++ {
 		x, y := a[i], b[i]
 		if x >= 'A' && x <= 'Z' {
 			x += 'a' - 'A'
@@ -523,7 +540,7 @@ func dnsQuestionEqual(a []byte, aEnd int, b []byte, bEnd int) bool {
 			return false
 		}
 	}
-	return bytes.Equal(a[aNameEnd:aEnd], b[bNameEnd:bEnd])
+	return bytes.Equal(a[nameEnd:aEnd], b[nameEnd:bEnd])
 }
 
 // readDNSQuery extracts and validates the DNS wire message from a DoH
@@ -600,10 +617,10 @@ func (s *server) upstreamReady() bool {
 }
 
 func (s *server) probeUpstream() bool {
-	d := &net.Dialer{Timeout: upstreamProbeTimeout}
-	// The probe shares the transport's read-only loopbackTLSConfig instead
-	// of allocating a fresh tls.Config for every probe.
-	conn, err := tls.DialWithDialer(d, "tcp", s.upstreamHost, loopbackTLSConfig)
+	// The probe shares the transport's read-only loopbackTLSConfig and the
+	// package-level probeDialer instead of allocating a fresh tls.Config and
+	// net.Dialer for every probe.
+	conn, err := tls.DialWithDialer(probeDialer, "tcp", s.upstreamHost, loopbackTLSConfig)
 	if err != nil {
 		return false
 	}
@@ -619,7 +636,7 @@ func allowGetOrHead(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	w.Header().Set("Allow", "GET, HEAD")
-	w.WriteHeader(http.StatusMethodNotAllowed)
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	return false
 }
 
@@ -649,13 +666,14 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// doh handles requests for the configured DoH path only; the mux dispatches
-// exactly matching paths here and validateDoHPath keeps reserved paths free,
-// so no additional path check is needed inside the handler.
+// doh handles requests for the configured DoH path only; the root mux wrapper
+// dispatches matching paths here, and validateDoHPath keeps the reserved
+// /health and / paths free, so no additional path check is needed inside the
+// handler.
 func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
@@ -684,7 +702,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "client tracking capacity reached")
 		return
-	default:
+	case rateInvalidAddress:
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "client IP address unavailable")
 		return
@@ -795,6 +813,19 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// route dispatches the catch-all "/" mux pattern: the configured DoH path, the
+// service-info root, or a JSON 404 (consistent with every other error body).
+func (s *server) route(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case s.dohPath:
+		s.doh(w, r)
+	case "/":
+		s.root(w, r)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
 func main() {
 	port := strconv.Itoa(getenvInt("PORT", defaultPort, 1, 65535))
 	dohPath := getenv("DOH_PATH", defaultDoHPath)
@@ -864,26 +895,17 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == s.dohPath {
-			s.doh(w, r)
-			return
-		}
-		if r.URL.Path == "/" {
-			s.root(w, r)
-			return
-		}
-		http.NotFound(w, r)
-	})
+	mux.HandleFunc("/", s.route)
 
 	h := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       requestReadTimeout,
-		// WriteTimeout starts after request headers are read and continues
-		// while the body is read and the upstream response is produced. Leave
-		// enough budget for a full request-read interval plus the upstream
-		// deadline, rather than silently truncating slow valid requests early.
+		// WriteTimeout is reset by net/http when a request's headers are
+		// read, so it overlaps the 7s request-read window instead of
+		// starting after it. 13s (7s read + 6s upstream) covers the worst
+		// case where a slow body consumes the full read interval and the
+		// upstream then uses its full deadline.
 		WriteTimeout:   responseWriteTimeout,
 		IdleTimeout:    30 * time.Second,
 		MaxHeaderBytes: defaultMaxHeaderBytes,

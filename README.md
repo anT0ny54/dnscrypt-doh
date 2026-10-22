@@ -45,7 +45,7 @@ The container runs [tini](https://github.com/krallin/tini) as PID 1 for signal f
 `entrypoint.sh`:
 
 1. Validates the dnscrypt-proxy configuration with `-check`.
-2. Starts dnscrypt-proxy and then the gateway.
+2. Starts dnscrypt-proxy (logging to stderr; no `log_file`, so the unprivileged user never reopens `/dev/stdout`) and then the gateway.
 3. Exits with status 1 if either process dies.
 4. On `SIGTERM`, `SIGINT`, or `SIGHUP`, stops the gateway first so in-flight requests can drain for up to 5 seconds, then stops dnscrypt-proxy.
 
@@ -63,7 +63,7 @@ All gateway settings are environment variables. Invalid or out-of-range numeric 
 | `MAX_CONCURRENCY` | `8` | `8` | 1-16 |
 | `MAX_CLIENT_IPS` | `8192` | `8192` | 64-32,768 tracked clients (IPv4 addresses or IPv6 /64 prefixes) |
 | `TRUST_PROXY_HEADERS` | `false` | `true` | `1/true/yes/on` or `0/false/no/off` |
-| `GOMAXPROCS`, `GOGC`, `GOMEMLIMIT` | Go runtime defaults | `1`, `100`, `160MiB` | Applies independently to each Go process |
+| `GOMAXPROCS`, `GOMEMLIMIT` | Go runtime defaults | `1`, `160MiB` | Applies independently to each Go process |
 
 ### `DOH_PATH` rules
 
@@ -107,15 +107,19 @@ or the configured custom domain on an Always-On container.
 
 Returns `200` with `{"status":"ok","service":"minimal-hagezi-doh","uptime":"..."}` when the gateway can complete a real TLS handshake with the local dnscrypt-proxy DoH listener; otherwise it returns `503` with the same fields and `"status":"starting"`. Both TCP establishment and the TLS handshake are bounded by a 500 ms deadline, and the result is cached for 2 seconds so orchestrator checks do not create excessive handshake load.
 
-A real TLS handshake is required because a bare TCP open/close is logged by Go's HTTP server as a spurious TLS EOF. `GET` and `HEAD` are supported; other methods return 405.
+A real TLS handshake is required because a bare TCP open/close is logged by Go's HTTP server as a spurious TLS EOF. `GET` and `HEAD` are supported; other methods return 405 with a JSON error body.
 
 ### `GET /`
 
-Returns a small service-information JSON response. `GET` and `HEAD` are supported; other methods return 405 with `Allow: GET, HEAD`.
+Returns a small service-information JSON response. `GET` and `HEAD` are supported; other methods return 405 with `Allow: GET, HEAD` and a JSON error body.
+
+### Unknown paths
+
+Any other path returns 404 with a JSON error body, consistent with every other error response.
 
 ### DoH requests
 
-`GET` and `POST` are supported on `DOH_PATH`; other methods return 405 with `Allow: GET, POST`.
+`GET` and `POST` are supported on `DOH_PATH`; other methods return 405 with `Allow: GET, POST` and a JSON error body.
 
 - `POST` requires `Content-Type: application/dns-message` and a body no larger than `MAX_DNS_MESSAGE_BYTES`.
 - `GET` requires exactly one RFC 8484 `dns` parameter containing raw URL-safe base64 without padding. Duplicate `dns` parameters and malformed query strings are rejected. The encoded parameter is hard-capped at 12,288 characters, which caps the decoded message at 9,216 bytes; with the default `MAX_DNS_MESSAGE_BYTES=8192` the binding limit is 10,923 characters (`base64.RawURLEncoding.EncodedLen(8192)`). `MAX_DNS_MESSAGE_BYTES` values above 9,216 therefore only take effect for `POST`.
@@ -137,7 +141,6 @@ Keep `true` only while a front edge overwrites those headers. If you ever publis
 The image sets:
 
 - `GOMAXPROCS=1`
-- `GOGC=100`
 - `GOMEMLIMIT=160MiB`
 
 Those Go settings apply independently to the gateway and dnscrypt-proxy. The 512 MB container also uses:
@@ -148,7 +151,7 @@ Those Go settings apply independently to the gateway and dnscrypt-proxy. The 512
 - gateway concurrency ceiling: 8 (16 hard cap)
 - default DNS message size: 8,192 bytes
 
-The gateway binds its socket before announcing startup, validates the configured path before serving, drains for up to 5 seconds on shutdown, and does not follow upstream redirects. The HTTP request-read timeout is 7 seconds (2 seconds for headers and for a `POST` body once a concurrency slot is held); the 13-second response-write deadline leaves room for that read interval plus the full 6-second upstream deadline, instead of cutting off a slow accepted request before the upstream budget expires.
+The gateway binds its socket before announcing startup, validates the configured path before serving, drains for up to 5 seconds on shutdown, and does not follow upstream redirects. The HTTP request-read timeout is 7 seconds (2 seconds for headers and for a `POST` body once a concurrency slot is held). The 13-second response-write deadline overlaps that read window — net/http resets it when a request's headers are read — and is sized as 7 seconds of request reading plus the full 6-second upstream deadline, so a slow accepted request is not cut off before the upstream budget expires.
 
 ## Local build and run
 
@@ -164,11 +167,11 @@ cp .env.example .env
 
 The image bakes in `TRUST_PROXY_HEADERS=true`, matching the SnapDeploy deployment, so local runs behave exactly like production behind SnapDeploy's managed edge. The Compose file does not set it in an `environment:` mapping, so `TRUST_PROXY_HEADERS=false` in `.env` takes effect instead of being silently ignored — use that when you run the container with the port directly reachable and no header-overwriting edge in front (see "Proxy-header trust"). Compose explicitly passes its resolved `PORT` value into the container and uses the same value for the host/container port mapping, including when a shell environment variable overrides `.env`.
 
-The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. File modes and ownership in the runtime image are set with `COPY --chmod`/`--chown` (BuildKit) instead of a separate `RUN chmod`, which would duplicate the binaries in an extra layer. The `.dockerignore` keeps the build context minimal (gateway source, Compose-independent config, and the entrypoint only); it also excludes local `.env` files and the workflow-generated `keep-alive.txt` so they are not sent to the builder. The runtime image runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds.
+The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. File modes and ownership in the runtime image are set with `COPY --chmod`/`--chown` (BuildKit) instead of a separate `RUN chmod`, which would duplicate the binaries in an extra layer. The `.dockerignore` keeps the build context minimal (gateway source, Compose-independent config, and the entrypoint only); it also excludes local `.env` files and the workflow-generated `keep-alive.txt` so they are not sent to the builder. The runtime image contains only `ca-certificates`, `tini` and the binaries (no unused `tzdata`), runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds.
 
 ## Testing
 
-The gateway ships a comprehensive test suite (`main_test.go`) covering DNS wire-format validation (single question, single root-owned OPT record, 255-byte names, backward-only compression pointers, 4,096-record ceiling), rate limiting (IPv6 /64 grouping, global capacity and correct 429/503 status handling, cleanup), proxy-header parsing, path validation, upstream error handling, health-check caching, and 405 handling on `/health` and `/`. The Docker build refuses to produce an image if `go test` or `go vet` fails.
+The gateway ships a comprehensive test suite (`main_test.go`) covering DNS wire-format validation (single question, single root-owned OPT record, 255-byte names, backward-only compression pointers, 4,096-record ceiling), rate limiting (IPv6 /64 grouping, global capacity and correct 429/503 status handling, cleanup), proxy-header parsing, path validation, request routing (including the JSON 404), upstream error handling, health-check caching, and 405 handling on `/health` and `/`. The Docker build refuses to produce an image if `go test` or `go vet` fails.
 
 ## Repository keep-alive
 

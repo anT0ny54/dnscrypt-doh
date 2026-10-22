@@ -457,6 +457,25 @@ func TestRateLimiterSharedShardDoesNotReduceGlobalCapacity(t *testing.T) {
 	}
 }
 
+func TestRateLimiterCleanupKeepsFutureWindowEntries(t *testing.T) {
+	r := newRateLimiter(5, 60, 64)
+	ip := netip.MustParseAddr("192.0.2.31")
+	if r.allow(ip) != rateAllowed {
+		t.Fatal("first request should be allowed")
+	}
+	sh := &r.shards[int(addrHash(ip)%shardCount)]
+	entry := sh.m[ip]
+	entry.window++ // pretend the clock jumped backwards after the entry was stored
+	sh.m[ip] = entry
+	r.cleanup()
+	if got := len(sh.m); got != 1 {
+		t.Fatalf("future-window entries removed by cleanup = %d, want 1", got)
+	}
+	if got := r.entries.Load(); got != 1 {
+		t.Fatalf("entries after cleanup = %d, want 1", got)
+	}
+}
+
 func TestRateLimiterCleanupReleasesGlobalCapacity(t *testing.T) {
 	r := newRateLimiter(1, 60, 64)
 	ip := netip.MustParseAddr("192.0.2.30")
@@ -1074,5 +1093,30 @@ func TestParseClientIPUsesFirstForwardedAddressOnlyWhenTrusted(t *testing.T) {
 	}
 	if got, want := parseClientIP(r, false), netip.MustParseAddr("127.0.0.1"); got != want {
 		t.Fatalf("untrusted: got %s, want %s", got, want)
+	}
+}
+
+func TestRouteDispatchesPathsAndReturnsJSON404(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+
+	rec := httptest.NewRecorder()
+	s.route(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown path status = %d, want 404", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("404 Content-Type = %q, want JSON", got)
+	}
+
+	rec = httptest.NewRecorder()
+	s.route(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root status = %d, want 200", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	s.route(rec, httptest.NewRequest(http.MethodPut, defaultDoHPath, nil))
+	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET, POST" {
+		t.Fatalf("DoH path dispatch: status=%d Allow=%q, want 405 and %q", rec.Code, rec.Header().Get("Allow"), "GET, POST")
 	}
 }
