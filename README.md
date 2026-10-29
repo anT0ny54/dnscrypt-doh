@@ -40,14 +40,14 @@ SnapDeploy supplies the public TLS certificate and routes HTTP to the container 
 
 ## Process supervision
 
-The container runs [tini](https://github.com/krallin/tini) as PID 1 for signal forwarding and PID-1 reaping duties. The entrypoint shell remains the direct parent of dnscrypt-proxy and the gateway and blocks in `wait -n` so a service exit is reaped and detected immediately. `kill -0` polling is not used for liveness: on shells that do not opportunistically reap background jobs, an unreaped child stays a zombie that `kill -0` still reports as alive, so a crashed service would otherwise go undetected.
+The container runs [tini](https://github.com/krallin/tini) as PID 1 for signal forwarding and PID-1 reaping duties. The entrypoint shell remains the direct parent of dnscrypt-proxy and the gateway, checks each child's Linux process state every 500 ms, and explicitly reaps an exited service before shutting the other one down. It does not rely on BusyBox `ash`'s `wait -n`, which has edge cases where an already-exited older child can be missed while a newer child remains running; nor does it use `kill -0` alone, since that can report a zombie as alive.
 Signal and exit traps are installed before configuration validation and service startup, so a stop signal during the startup window still drains the gateway before the resolver is stopped.
 
 `entrypoint.sh`:
 
 1. Validates the dnscrypt-proxy configuration with `-check`.
 2. Starts dnscrypt-proxy (logging to stderr; no `log_file`, so the unprivileged user never reopens `/dev/stdout`) and then the gateway.
-3. Exits with status 1 if either process dies.
+3. Checks both child process states every 500 ms and exits with status 1 if either process dies.
 4. On `SIGTERM`, `SIGINT`, or `SIGHUP`, stops the gateway first so in-flight requests can drain for up to 5 seconds, then stops dnscrypt-proxy.
 
 ## Configuration
@@ -61,7 +61,7 @@ All gateway settings are environment variables. Invalid or out-of-range numeric 
 | `RATE_LIMIT` | `99` | `99` | 1-1,000,000 requests per window per client (IPv4 address or IPv6 /64) |
 | `RATE_WINDOW_SECONDS` | `60` | `60` | 1-86,400 |
 | `MAX_DNS_MESSAGE_BYTES` | `8192` | `8192` | 512-65,535 |
-| `MAX_CONCURRENCY` | `8` | `8` | 1-16 |
+| `MAX_CONCURRENCY` | `16` | `16` | 1-16; hard ceiling for the 0.25 vCPU tier |
 | `MAX_CLIENT_IPS` | `8192` | `8192` | 64-32,768 tracked clients (IPv4 addresses or IPv6 /64 prefixes) |
 | `TRUST_PROXY_HEADERS` | `false` | `true` | `1/true/yes/on` or `0/false/no/off`; Compose defaults to `false` for direct local publishing |
 | `GOMAXPROCS`, `GOMEMLIMIT` | Go runtime defaults | `1`, `160MiB` | Applies independently to each Go process |
@@ -72,8 +72,8 @@ A custom path must be reachable exactly as configured. The gateway rejects:
 
 - paths not starting with `/`;
 - `/` and `/health`, which are reserved;
-- paths containing `?`, `#` or `%` (the mux matches the decoded URL path, so a percent-escape in the configured path could never match a normal request);
-- repeated slashes or dot segments that Go's `http.ServeMux` would clean and redirect before dispatch.
+- paths containing `?`, `#` or `%` (query/fragment delimiters and percent signs make the configured decoded path ambiguous with its escaped URL spelling);
+- repeated slashes or dot segments, which create non-canonical and ambiguous URL paths.
 
 A single trailing slash is allowed.
 
@@ -83,9 +83,9 @@ The internal upstream URL `https://127.0.0.1:8053/dns-query` is fixed in `main.g
 
 The default allows 99 `/dns-query` requests per fixed 60-second window per client. A client is an IPv4 address, or the /64 prefix of an IPv6 address, so a single IPv6 subscriber cannot obtain extra quota by rotating addresses inside its /64. Malformed requests on supported methods consume quota; `/health` and `/` are not rate-limited.
 
-The limiter uses 64 shards, lazy per-shard maps, direct map-value entries, and a global atomic entry cap. This avoids rejecting a client merely because one hash shard fills before the configured client-table limit is reached. Its cleanup interval is the configured window capped at 30 seconds. Requests from an already-tracked client that exceed their quota receive HTTP 429; when the global client-tracking table is full, new identities receive HTTP 503 with `Retry-After: 1` instead of being misreported as per-client rate limits.
+The limiter normalizes IPv4-mapped IPv6 addresses to plain IPv4 before keying, and uses 64 shards, lazy per-shard maps, direct map-value entries, and a global atomic entry cap. A shard map is only allocated after a new identity successfully reserves a global table slot, so rejected identities do not create empty maps when the table is full. This avoids rejecting a client merely because one hash shard fills before the configured client-table limit is reached. Its cleanup interval is the configured window capped at 30 seconds. Requests from an already-tracked client that exceed their quota receive HTTP 429; when the global client-tracking table is full, new identities receive HTTP 503 with `Retry-After: 1` instead of being misreported as per-client rate limits.
 
-A global concurrency semaphore defaults to 8 simultaneous DoH requests. It is acquired before request-body/base64 parsing so CPU and memory spent on decoding are bounded under request floods. When full, new requests receive HTTP 503 with `Retry-After: 1` (the same response used for client-table-capacity and invalid-client-IP failures); the slot is released for every response path. Because the slot is held while a `POST` body is read, the body read is bounded by a dedicated 2-second deadline (best effort, via `http.ResponseController`) so a client trickling its body cannot pin a slot for the full 7-second request-read timeout.
+A global concurrency semaphore defaults to 16 simultaneous DoH requests. It is acquired before request-body/base64 parsing so CPU and memory spent on decoding are bounded under request floods. When full, new requests receive HTTP 503 with `Retry-After: 1` (the same response used for client-table-capacity and invalid-client-IP failures); the slot is released for every response path. Because the slot is held while a `POST` body is read, the body read is bounded by a dedicated 2-second deadline (best effort, via `http.ResponseController`) so a client trickling its body cannot pin a slot for the full 7-second request-read timeout. The deadline is cleared as soon as the body has been read: otherwise net/http's background connection read would hit it while the request waits for the upstream and cancel the request context, aborting slow but valid lookups with a 502. The upstream wait is bounded by its own 6-second context.
 
 ## SnapDeploy deployment
 
@@ -106,7 +106,7 @@ or the configured custom domain on an Always-On container.
 
 ### `GET /health`
 
-Returns `200` with `{"status":"ok","service":"minimal-hagezi-doh","uptime":"..."}` when the gateway can complete a real TLS handshake with the local dnscrypt-proxy DoH listener; otherwise it returns `503` with the same fields and `"status":"starting"`. Both TCP establishment and the TLS handshake are bounded by a 500 ms deadline, and the result is cached for 2 seconds so orchestrator checks do not create excessive handshake load.
+Returns `200` with `{"status":"ok","service":"minimal-hagezi-doh","uptime":"..."}` when the gateway can complete a real TLS handshake with the local dnscrypt-proxy DoH listener; otherwise it returns `503` with the same fields and `"status":"starting"`. The TCP dial and the TLS handshake share a single 500 ms deadline (one context covers both), and the result is cached for 2 seconds so orchestrator checks do not create excessive handshake load. If a check arrives while another probe is still running (the handshake can take up to 500 ms), it receives the last cached result instead of waiting; the first check after the probe completes reports the fresh state.
 
 A real TLS handshake is required because a bare TCP open/close is logged by Go's HTTP server as a spurious TLS EOF. `GET` and `HEAD` are supported; other methods return 405 with a JSON error body.
 
@@ -116,19 +116,20 @@ Returns a small service-information JSON response. `GET` and `HEAD` are supporte
 
 ### Unknown paths
 
-Any other path returns 404 with a JSON error body, consistent with every other error response.
+Any other path returns 404 with a JSON error body, consistent with every other error response. The gateway dispatches paths directly rather than through `http.ServeMux`, so dot segments and repeated slashes are not silently redirected to a different endpoint. It also rejects alternate percent-encoded spellings of a registered path (for example, `/%68ealth` or `/dns%2Dquery`) instead of routing them after URL decoding. Canonical escaping for characters that require it remains supported.
 
 ### DoH requests
 
 `GET` and `POST` are supported on `DOH_PATH`; other methods return 405 with `Allow: GET, POST` and a JSON error body.
 
-- `POST` requires `Content-Type: application/dns-message` and a body no larger than `MAX_DNS_MESSAGE_BYTES`.
+- `POST` requires `Content-Type: application/dns-message` and a body no larger than `MAX_DNS_MESSAGE_BYTES`. Request and upstream-response bodies are read through one size-bounded helper that pre-sizes its buffer from `Content-Length`.
 - `GET` requires exactly one RFC 8484 `dns` parameter containing raw URL-safe base64 without padding. Duplicate `dns` parameters, malformed query strings, and line breaks inside the encoded value are rejected. The encoded parameter is hard-capped at 12,288 characters, which caps the decoded message at 9,216 bytes; with the default `MAX_DNS_MESSAGE_BYTES=8192` the binding limit is 10,923 characters (`base64.RawURLEncoding.EncodedLen(8192)`). `MAX_DNS_MESSAGE_BYTES` values above 9,216 therefore only take effect for `POST`.
-- A long single-parameter query is rejected with 414 before parsing. Extra query parameters remain tolerated; in that case the total query is bounded by `MaxHeaderBytes`, and the `dns` value is independently checked against its encoded-size ceiling.
+- A long single-parameter query is rejected with 414 before parsing. Only `&` counts as a tolerated parameter separator: `url.ParseQuery` rejects query settings containing `;`, so a semicolon does not exempt an oversized query from the fast-fail. Extra query parameters remain tolerated; in that case the total query is bounded by `MaxHeaderBytes`, and the `dns` value is independently checked against its encoded-size ceiling.
 - DNS message structure is validated before forwarding: exactly one uncompressed question, no answer or authority records in queries, at most one root-owned EDNS OPT record in the final additional-record position, correctly framed EDNS options, no trailing bytes, the 255-byte name limit, backward-only compression pointers in resource-record owner names, and a 4,096-record ceiling. Label payload bytes are treated as opaque octets, not as name-encoding markers. Upstream responses also reject duplicate, misplaced, or non-final OPT records and malformed EDNS option framing.
 - Upstream responses must be valid DNS responses with matching ID, opcode, and question. DNS question names are compared case-insensitively as required by DNS name semantics; QTYPE and QCLASS must match exactly.
 - Upstream errors return 502; upstream timeouts return 504; the upstream deadline is 6 seconds and covers response-body reads.
-- Non-2xx upstream statuses, redirects, invalid content types, and oversized responses are rejected with 502.
+- Upstream responses must be HTTP 200 per RFC 8484; any other status (including other 2xx codes), redirects, invalid content types, and oversized responses are rejected with 502.
+- Every upstream rejection path (non-200 status, invalid content type, oversized response) drains the bounded response body before the gateway replies, so the loopback connection is reused instead of closed during upstream error bursts.
 - Successful responses carry `Cache-Control: no-store`; dnscrypt-proxy retains its own bounded in-memory cache.
 - Rate-limited clients receive 429 with `Retry-After` set to the remaining whole seconds until the current fixed window resets (from 1 through `RATE_WINDOW_SECONDS`).
 
@@ -150,10 +151,10 @@ Those Go settings apply independently to the gateway and dnscrypt-proxy. The 512
 - dnscrypt-proxy cache: 16,384 entries
 - localhost DNS client ceiling: 16
 - public client-identity ceiling: 8,192
-- gateway concurrency ceiling: 8 (16 hard cap)
+- gateway concurrency ceiling: 16
 - default DNS message size: 8,192 bytes
 
-The gateway binds its socket before announcing startup, validates the configured path before serving, drains for up to 5 seconds on shutdown, and does not follow upstream redirects. The HTTP request-read timeout is 7 seconds (2 seconds for headers and for a `POST` body once a concurrency slot is held). The 13-second response-write deadline overlaps that read window — net/http resets it when a request's headers are read — and is sized as 7 seconds of request reading plus the full 6-second upstream deadline, so a slow accepted request is not cut off before the upstream budget expires.
+The `/health` and `/` JSON responses are built with pre-sized maps (capacity hints) rather than literals, so the orchestrator's fixed-interval polls do not pay map-growth reallocations. The gateway binds its socket before announcing startup, validates the configured path before serving, drains for up to 5 seconds on shutdown, and does not follow upstream redirects. The HTTP request-read timeout is 7 seconds (2 seconds for headers and for a `POST` body once a concurrency slot is held, with the body deadline cleared after the body is read). The 13-second response-write deadline overlaps that read window — net/http resets it when a request's headers are read — and is sized as 7 seconds of request reading plus the full 6-second upstream deadline, so a slow accepted request is not cut off before the upstream budget expires.
 
 ## Local build and run
 
@@ -177,11 +178,11 @@ cp .env.example .env
 
 The image bakes in `TRUST_PROXY_HEADERS=true` for SnapDeploy. Compose deliberately overrides that with a local default of `false`, because its published port is directly reachable; the value can be overridden from the shell or project `.env` when an actual trusted proxy overwrites forwarding headers (see "Proxy-header trust"). The supplied `.env.example` also uses `false` for this reason. Compose explicitly passes its resolved `PORT` value into the container and uses the same value for the host/container port mapping, including when a shell environment variable overrides `.env`.
 
-The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. File modes and ownership in the runtime image are set with `COPY --chmod`/`--chown` (BuildKit) instead of a separate `RUN chmod`, which would duplicate the binaries in an extra layer. The `.dockerignore` keeps the build context minimal: it excludes documentation, Compose files, Git and workflow metadata, local `.env` files, release archives and the workflow-generated `keep-alive.txt`, so only the Dockerfile, gateway source, `dnscrypt-proxy.toml` and `entrypoint.sh` reach the builder. The runtime image contains only `ca-certificates`, `tini` and the binaries (no unused `tzdata`), runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds using the same valid-port fallback as the gateway.
+The multi-stage Dockerfile checksum-verifies the pinned Go and dnscrypt-proxy archives, runs the gateway tests and `go vet`, and builds both binaries. File modes and ownership in the runtime image are set with `COPY --chmod`/`--chown` (BuildKit) instead of a separate `RUN chmod`, which would duplicate the binaries in an extra layer. The `.dockerignore` keeps the build context minimal: it excludes documentation, Compose files, Git and workflow metadata, local `.env` files, release archives and the workflow-generated `keep-alive.txt`, so only the Dockerfile, gateway source, `dnscrypt-proxy.toml` and `entrypoint.sh` reach the builder. The runtime image installs only the `ca-certificates` and `tini` packages (no unused `tzdata`), includes the required binaries, configuration, entrypoint and local certificate, runs as the unprivileged `doh` user, exposes port 8080, and defines a `HEALTHCHECK` that requests `/health` every 15 seconds using the same valid-port fallback as the gateway.
 
 ## Testing
 
-The gateway ships a test suite (`main_test.go`) covering DNS wire-format structure (single question, arbitrary high bytes in label payloads, single root-owned OPT record, EDNS option framing, strict base64url input including line-break rejection, oversized-query fast-fail without rejecting valid extra parameters, 255-byte name boundary (accepted at 255, rejected at 256), backward-only compression pointers in resource-record owner names, uncompressed questions, and the 4,096-record ceiling), rate limiting (IPv6 /64 grouping, global capacity, 429/503 handling, and cleanup), proxy-header parsing, path validation, request routing (including JSON 404 responses), upstream response ID/opcode/question matching, upstream error handling, health-check caching and probe-deadline bounds (including cleanup when a probe stalls), and 405 handling on `/health` and `/`. The Docker build refuses to produce an image if `go test` or `go vet` fails.
+The gateway ships a test suite (`main_test.go`) covering DNS wire-format structure (single question, arbitrary high bytes in label payloads, single root-owned OPT record, EDNS option framing, strict base64url input including line-break rejection, oversized-query fast-fail (including semicolon-containing queries, which the query parser rejects) without rejecting valid extra parameters, 255-byte name boundary (accepted at 255, rejected at 256), backward-only compression pointers in resource-record owner names, uncompressed questions, and the 4,096-record ceiling), rate limiting (IPv6 /64 grouping, global capacity, 429/503 handling, and cleanup), proxy-header parsing, path validation and request routing (JSON 404 responses, rejection of repeated slashes, dot segments and percent-encoded endpoint aliases without redirects, and support for canonical escaping of configured paths), upstream response ID/opcode/question matching, bounded body reads (including draining rejected upstream bodies so the loopback connection is reused), IPv4-mapped client keys, upstream error handling, health-check caching and the single shared dial-plus-handshake probe deadline (including cleanup when a probe stalls), and 405 handling on `/health` and `/`. The Docker build refuses to produce an image if `go test` or `go vet` fails.
 
 ## Repository keep-alive
 

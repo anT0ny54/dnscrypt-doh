@@ -4,9 +4,7 @@
 ##############################################
 
 # The classic plain-DNS/DNSCrypt listener is intentionally disabled. The
-# Go gateway only ever talks to the [local_doh] listener below on
-# 127.0.0.1:8053; a second listener on 5353 had nothing bound to it and
-# was just an unused open loopback port.
+# Go gateway only talks to the [local_doh] listener below on 127.0.0.1:8053.
 listen_addresses = []
 
 # Keep only the protocols we need.

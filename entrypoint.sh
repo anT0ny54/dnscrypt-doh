@@ -29,33 +29,51 @@ trap cleanup EXIT
 
 "$DNSCRYPT" -config "$CONFIG" -check
 
+# Report a child as running only while its Linux process exists in a live
+# state. kill -0 alone is insufficient: a shell may leave an exited child as a
+# zombie, for which kill -0 still succeeds. Parsing /proc avoids relying on
+# BusyBox ash's wait -n, which can miss an older child that exited before the
+# wait began while a newer child keeps running.
+child_running() {
+  [ -r "/proc/$1/stat" ] || return 1
+  process_stat=
+  read -r process_stat < "/proc/$1/stat" || return 1
+  # The comm field is parenthesized and may contain spaces; strip through its
+  # final ") " delimiter so the first remaining field is the process state.
+  process_stat=${process_stat##*) }
+  case "$process_stat" in
+    Z*|X*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # tini handles PID-1 signal/reaping duties. This shell remains the direct
-# parent of both services and reaps them via wait, so kill -0 can detect
-# termination without relying on a fixed startup sleep.
-# Readiness is intentionally NOT gated here with a fixed sleep: the gateway's
-# /health endpoint reports 503 until the dnscrypt-proxy DoH listener completes
-# a TLS handshake, which lets the container orchestrator observe real readiness
-# through its health check instead of racing a guessed startup delay.
+# parent of both services. Readiness is intentionally NOT gated here with a
+# startup sleep: /health reports 503 until the gateway completes a TLS
+# handshake with dnscrypt-proxy, allowing the orchestrator to observe readiness.
 "$DNSCRYPT" -config "$CONFIG" &
 dns_pid=$!
 
 "$GATEWAY" &
 gateway_pid=$!
 
-# Block in wait -n until either service exits; wait -n also reaps the exited
-# child, so the death is detected immediately instead of after a poll delay.
-# kill -0 polling is deliberately not used for liveness: on shells that do not
-# opportunistically reap background jobs, an unreaped child stays a zombie that
-# kill -0 still reports as alive, so a crashed service would never be detected.
-# Signals interrupt wait -n and run the traps installed above.
+# Poll only process state, not readiness. A 500 ms interval detects a service
+# exit promptly without forking `sleep` ten times a second on a 0.25 vCPU
+# container, and without depending on non-portable or shell-version-sensitive
+# wait -n behavior. Explicit wait calls reap whichever child has exited before
+# cleanup.
 while :; do
-  wait -n 2>/dev/null || true
-  if ! kill -0 "$dns_pid" 2>/dev/null; then
+  if ! child_running "$dns_pid"; then
+    wait "$dns_pid" 2>/dev/null || true
+    dns_pid=
     echo "dnscrypt-proxy stopped; shutting down" >&2
     exit 1
   fi
-  if ! kill -0 "$gateway_pid" 2>/dev/null; then
+  if ! child_running "$gateway_pid"; then
+    wait "$gateway_pid" 2>/dev/null || true
+    gateway_pid=
     echo "DoH gateway stopped; shutting down" >&2
     exit 1
   fi
+  sleep 0.5
 done

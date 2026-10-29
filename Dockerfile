@@ -20,7 +20,7 @@ COPY --from=build --chmod=0755 /out/doh-gateway /usr/local/bin/doh-gateway
 COPY --from=build --chown=doh:doh --chmod=0600 /out/localhost.pem /etc/localhost.pem
 COPY dnscrypt-proxy.toml /etc/dnscrypt-proxy.toml
 COPY --chmod=0755 entrypoint.sh /entrypoint.sh
-ENV GOMAXPROCS=1 GOMEMLIMIT=160MiB PORT=8080 DOH_PATH=/dns-query RATE_LIMIT=99 RATE_WINDOW_SECONDS=60 MAX_DNS_MESSAGE_BYTES=8192 MAX_CONCURRENCY=8 MAX_CLIENT_IPS=8192 TRUST_PROXY_HEADERS=true
+ENV GOMAXPROCS=1 GOMEMLIMIT=160MiB PORT=8080 DOH_PATH=/dns-query RATE_LIMIT=99 RATE_WINDOW_SECONDS=60 MAX_DNS_MESSAGE_BYTES=8192 MAX_CONCURRENCY=16 MAX_CLIENT_IPS=8192 TRUST_PROXY_HEADERS=true
 EXPOSE 8080
 USER doh
 # Mirror getenvInt's PORT fallback so an invalid runtime PORT does not make

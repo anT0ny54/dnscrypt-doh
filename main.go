@@ -34,10 +34,15 @@ const (
 	defaultRateLimit       = 99
 	defaultRateWindowSec   = 60
 	defaultMaxBodyBytes    = 8192
-	defaultConcurrency     = 8
+	defaultConcurrency     = 16
 	defaultClientEntries   = 8192
 	defaultMaxHeaderBytes  = 16 << 10
 	defaultMaxGetQuerySize = 12 << 10
+	// maxGetQueryFastFail is the raw-query length above which a separator-less
+	// GET query is rejected with 414 before parsing. "&" is the only separator
+	// tolerated here: url.ParseQuery rejects query settings containing ";",
+	// so a semicolon must not let an oversized query bypass the fast-fail.
+	maxGetQueryFastFail    = defaultMaxGetQuerySize + len("dns=")
 	minMaxBodyBytes        = 512
 	maxMaxBodyBytes        = 65535
 	maxRateLimit           = 1000000
@@ -134,6 +139,10 @@ func (r *rateLimiter) allowWithRetryAfter(ip netip.Addr) (rateLimitResult, uint6
 	if !ip.IsValid() {
 		return rateInvalidAddress, 0
 	}
+	// Normalize IPv4-mapped IPv6 addresses first; otherwise the /64 grouping
+	// below would collapse every mapped IPv4 client into one shared quota.
+	// parseClientIP already unmaps, so this protects other callers.
+	ip = ip.Unmap()
 	// Rate-limit IPv6 clients per /64: a single subscriber normally controls
 	// a whole /64, so per-address keys would let one host mint unlimited
 	// identities and bypass the per-client quota.
@@ -149,18 +158,32 @@ func (r *rateLimiter) allowWithRetryAfter(ip netip.Addr) (rateLimitResult, uint6
 
 	// Read the clock after acquiring the shard lock so contention across a
 	// window boundary cannot make this decision use an already-expired window.
-	nowUnix := uint64(time.Now().Unix())
-	nowWindow := nowUnix / r.windowSec
-	if sh.m == nil {
-		sh.m = make(map[netip.Addr]rateEntry)
+	now := time.Now().Unix()
+	if now < 0 {
+		// A pre-epoch wall clock wraps to ~2^64 as uint64, so every request
+		// would land in a fresh window and per-client rate limiting would
+		// silently switch off. Pin to the epoch so behavior degrades to one
+		// long window instead of no limiting.
+		now = 0
 	}
-	entry, ok := sh.m[ip]
+	nowUnix := uint64(now)
+	nowWindow := nowUnix / r.windowSec
+	var entry rateEntry
+	var ok bool
+	if sh.m != nil {
+		entry, ok = sh.m[ip]
+	}
 	if !ok {
 		// The global entry counter is the hard capacity guard. A previous
 		// per-shard-only cap could reject a client merely because its hash
 		// bucket filled early, even when other shards still had capacity.
 		if !r.reserveEntry() {
 			return rateCapacityReached, 0
+		}
+		// Do not allocate an otherwise-unused shard map for a client that
+		// cannot be tracked because the global table is already full.
+		if sh.m == nil {
+			sh.m = make(map[netip.Addr]rateEntry)
 		}
 		entry = rateEntry{window: nowWindow}
 	}
@@ -207,7 +230,11 @@ func (r *rateLimiter) cleanup() {
 		// Read the current window while holding each shard lock. Capturing it
 		// once before the loop could let a window rollover cause cleanup to
 		// delete newly-created entries from the next window.
-		nowWindow := uint64(time.Now().Unix()) / r.windowSec
+		nowUnix := time.Now().Unix()
+		if nowUnix < 0 {
+			nowUnix = 0
+		}
+		nowWindow := uint64(nowUnix) / r.windowSec
 		for k, v := range sh.m {
 			// Only expired windows may be reclaimed. A window ahead of
 			// nowWindow means the clock moved backwards after the entry was
@@ -235,8 +262,9 @@ var loopbackTLSConfig = &tls.Config{
 }
 
 // probeDialer is shared by all upstream health probes. A net.Dialer is safe
-// for concurrent use, so probes do not need to allocate their own copy.
-var probeDialer = &net.Dialer{Timeout: upstreamProbeTimeout}
+// for concurrent use. It has no Timeout of its own: the probe's context
+// carries the single deadline for the dial and the TLS handshake together.
+var probeDialer net.Dialer
 
 type server struct {
 	client *http.Client
@@ -251,6 +279,9 @@ type server struct {
 	maxBody      int64
 	maxEncoded   int
 	trustProxy   bool
+	// rateDesc is the root endpoint's rate-limit line, formatted once at
+	// startup so GET / does not run fmt.Sprintf on every request.
+	rateDesc     string
 	started      time.Time
 
 	// Cached upstream probe result so health checks do not perform a fresh
@@ -258,6 +289,9 @@ type server struct {
 	probeMu sync.Mutex
 	probeAt time.Time
 	probeOK bool
+	// probeRunning marks an in-flight probe so concurrent health checks use
+	// the last cached result instead of serializing behind the handshake.
+	probeRunning bool
 }
 
 func getenv(key, fallback string) string {
@@ -268,7 +302,15 @@ func getenv(key, fallback string) string {
 }
 
 func getenvInt(key string, fallback, lo, hi int) int {
-	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
+	raw := strings.TrimSpace(os.Getenv(key))
+	// strconv.Atoi accepts a leading "+", but net.Listen does not: a value
+	// like "+8080" passed range validation and then died at bind time with
+	// "listen tcp: lookup +8080: ..." instead of falling back. Reject it so
+	// numeric env vars behave like the health check's port normalization.
+	if strings.HasPrefix(raw, "+") {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
 	if err != nil || v < lo || v > hi {
 		return fallback
 	}
@@ -324,19 +366,19 @@ func parseClientIP(r *http.Request, trustProxy bool) netip.Addr {
 	return ip
 }
 
-// validateDoHPath rejects paths that cannot be reached by http.ServeMux and
-// paths that would shadow the reserved /health and / endpoints.
+// validateDoHPath rejects non-canonical public paths and paths that would
+// shadow the reserved /health and / endpoints.
 func validateDoHPath(dohPath string) error {
 	if !strings.HasPrefix(dohPath, "/") {
 		return fmt.Errorf("DOH_PATH must start with '/': %q", dohPath)
 	}
 	if strings.ContainsAny(dohPath, "?#%") {
-		// '%' is rejected because the mux matches the decoded URL path, so a
-		// configured percent-escape could never match a normal request.
+		// Query/fragment delimiters and percent signs are forbidden to keep the
+		// configured decoded path unambiguous with its escaped URL spelling.
 		return fmt.Errorf("DOH_PATH must not contain '?', '#' or '%%': %q", dohPath)
 	}
 	if canonicalHTTPPath(dohPath) != dohPath {
-		return fmt.Errorf("DOH_PATH must be canonical; repeated slashes and dot segments are redirected before matching: %q", dohPath)
+		return fmt.Errorf("DOH_PATH must be canonical; repeated slashes and dot segments are not allowed: %q", dohPath)
 	}
 	switch dohPath {
 	case "/", "/health":
@@ -345,17 +387,14 @@ func validateDoHPath(dohPath string) error {
 	return nil
 }
 
-// canonicalHTTPPath mirrors net/http's ServeMux path cleaning, including its
-// preservation of one trailing slash. A configured path that differs from the
-// cleaned form is unreachable because ServeMux redirects the request first.
+// canonicalHTTPPath applies slash/dot-segment normalization while preserving
+// one trailing slash. Requiring the configured path to already be canonical
+// avoids endpoint ambiguity across clients and intermediaries.
 //
 // The caller (validateDoHPath) has already verified that p starts with "/".
 func canonicalHTTPPath(p string) string {
 	cleaned := path.Clean(p)
 	if strings.HasSuffix(p, "/") && cleaned != "/" {
-		if len(p) == len(cleaned)+1 && strings.HasPrefix(p, cleaned) {
-			return p
-		}
 		cleaned += "/"
 	}
 	return cleaned
@@ -375,6 +414,17 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func isDNSMessageContentType(v string) bool {
 	mediaType, _, _ := strings.Cut(v, ";")
 	return strings.EqualFold(strings.TrimSpace(mediaType), "application/dns-message")
+}
+
+// drainBoundedBody discards up to limit bytes from an upstream error response
+// so the loopback HTTP connection can be reused. Reading beyond the configured
+// size cap is unnecessary because the response is being rejected anyway; one
+// byte past the cap is enough to prove the body is fully consumed when it is
+// small. All upstream-rejection paths must drain: returning with an unread
+// body forces net/http to close the connection, defeating MaxIdleConns reuse
+// during upstream error bursts.
+func drainBoundedBody(r io.Reader, limit int64) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(r, limit+1))
 }
 
 // dnsNameEnd validates a DNS name, including compression pointers, and returns
@@ -606,6 +656,25 @@ func dnsQuestionEqual(a []byte, aEnd int, b []byte, bEnd int) bool {
 	return bytes.Equal(a[nameEnd:aEnd], b[nameEnd:bEnd])
 }
 
+// readLimited reads at most limit bytes from r and reports whether the source
+// held more than that. sizeHint (a Content-Length, or <= 0 when unknown)
+// pre-sizes the buffer so a typical DNS message is read without repeated
+// io.ReadAll growth.
+func readLimited(r io.Reader, limit, sizeHint int64) (data []byte, tooLarge bool, err error) {
+	capacity := int64(512)
+	if sizeHint > 0 && sizeHint <= limit {
+		capacity = sizeHint + 1
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, capacity))
+	if _, err = buf.ReadFrom(io.LimitReader(r, limit+1)); err != nil {
+		return nil, false, err
+	}
+	if int64(buf.Len()) > limit {
+		return nil, true, nil
+	}
+	return buf.Bytes(), false, nil
+}
+
 // readDNSQuery extracts and validates the DNS wire message from a DoH
 // request, returning the message along with qEnd, the offset just past its
 // question section, so the caller can compare question sections without a
@@ -622,21 +691,21 @@ func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, 
 		if r.ContentLength > maxBody {
 			return nil, 0, http.StatusRequestEntityTooLarge
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+		body, tooLarge, err := readLimited(r.Body, maxBody, r.ContentLength)
 		if err != nil {
 			return nil, 0, http.StatusBadRequest
 		}
-		if int64(len(body)) > maxBody {
+		if tooLarge {
 			return nil, 0, http.StatusRequestEntityTooLarge
 		}
 		msg = body
 	} else {
-		// Fail fast only when a long raw query has no parameter separator.
-		// Extra parameters are tolerated, so the total query may exceed the DNS
+		// Fail fast only when a long raw query has no "&" separator. Extra
+		// parameters are tolerated, so the total query may exceed the DNS
 		// encoding ceiling while its dns value remains valid. MaxHeaderBytes
 		// bounds the amount of query data parsed when multiple parameters exist.
 		rawQuery := r.URL.RawQuery
-		if len(rawQuery) > defaultMaxGetQuerySize+len("dns=") && !strings.ContainsAny(rawQuery, "&;") {
+		if len(rawQuery) > maxGetQueryFastFail && !strings.Contains(rawQuery, "&") {
 			return nil, 0, http.StatusRequestURITooLong
 		}
 		values, err := url.ParseQuery(rawQuery)
@@ -685,42 +754,50 @@ func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, 
 // net/http logs any connection that closes before the handshake finishes.
 func (s *server) upstreamReady() bool {
 	s.probeMu.Lock()
-	defer s.probeMu.Unlock()
 	if time.Since(s.probeAt) < upstreamProbeCacheTTL {
-		return s.probeOK
+		ok := s.probeOK
+		s.probeMu.Unlock()
+		return ok
 	}
+	if s.probeRunning {
+		// Another health check is already performing the handshake. Return
+		// the last cached result rather than blocking this caller for up to
+		// upstreamProbeTimeout; the next check after the probe completes sees
+		// the fresh result.
+		ok := s.probeOK
+		s.probeMu.Unlock()
+		return ok
+	}
+	s.probeRunning = true
+	s.probeMu.Unlock()
+
 	ok := s.probeUpstream()
+
+	s.probeMu.Lock()
+	s.probeRunning = false
 	s.probeAt = time.Now()
 	s.probeOK = ok
+	s.probeMu.Unlock()
 	return ok
 }
 
 func (s *server) probeUpstream() bool {
-	// The probe shares the transport's read-only loopbackTLSConfig and the
-	// package-level probeDialer instead of allocating a fresh tls.Config and
-	// net.Dialer for every probe. tls.DialWithDialer is deliberately NOT used:
-	// it would give the TCP dial and TLS handshake separate timeout windows.
-	// One deadline is fixed before dialing and carried through the handshake,
-	// matching the documented total 500 ms probe budget.
-	deadline := time.Now().Add(upstreamProbeTimeout)
-	rawConn, err := probeDialer.Dial("tcp", s.upstreamHost)
+	// One context deadline covers both the TCP dial and the TLS handshake, so
+	// the probe really is bounded by upstreamProbeTimeout in total. A
+	// Dialer.Timeout plus a separate post-dial deadline would allow up to
+	// twice that. HandshakeContext closes the connection when the deadline
+	// expires, and the probe shares the transport's read-only
+	// loopbackTLSConfig instead of allocating a new one.
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamProbeTimeout)
+	defer cancel()
+	rawConn, err := probeDialer.DialContext(ctx, "tcp", s.upstreamHost)
 	if err != nil {
 		return false
 	}
-	if err := rawConn.SetDeadline(deadline); err != nil {
-		_ = rawConn.Close()
-		return false
-	}
+	// tls.Conn.Close also closes the underlying connection.
 	conn := tls.Client(rawConn, loopbackTLSConfig)
-	if err := conn.Handshake(); err != nil {
-		// Close the TLS connection itself, not the raw conn: tls.Conn.Close
-		// closes the underlying connection too and keeps the close path in
-		// one layer.
-		_ = conn.Close()
-		return false
-	}
-	_ = conn.Close()
-	return true
+	defer conn.Close()
+	return conn.HandshakeContext(ctx) == nil
 }
 
 // allowGetOrHead reports whether the request method is GET or HEAD. For any
@@ -743,22 +820,27 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if !s.upstreamReady() {
 		status, state = http.StatusServiceUnavailable, "starting"
 	}
-	writeJSON(w, status, map[string]any{
-		"status":  state,
-		"service": serviceName,
-		"uptime":  time.Since(s.started).Round(time.Second).String(),
-	})
+	// Pre-size the response map: the orchestrator polls /health on a fixed
+	// interval, and a literal map would grow through reallocations on every
+	// single call.
+	body := make(map[string]any, 3)
+	body["status"] = state
+	body["service"] = serviceName
+	body["uptime"] = time.Since(s.started).Round(time.Second).String()
+	writeJSON(w, status, body)
 }
 
 func (s *server) root(w http.ResponseWriter, r *http.Request) {
 	if !allowGetOrHead(w, r) {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"service":   serviceName,
-		"endpoint":  s.dohPath,
-		"rateLimit": fmt.Sprintf("%d requests/%ds per client IP", s.rate.limit, s.rate.windowSec),
-	})
+	// Pre-size the map like in health: these keys are fixed, so the capacity
+	// hint avoids the literal-map growth reallocations on every request.
+	body := make(map[string]any, 3)
+	body["service"] = serviceName
+	body["endpoint"] = s.dohPath
+	body["rateLimit"] = s.rateDesc
+	writeJSON(w, http.StatusOK, body)
 }
 
 // unavailableRetryAfter1 answers 503 with a one-second Retry-After hint. The
@@ -808,7 +890,8 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Method == http.MethodPost {
+	isPost := r.Method == http.MethodPost
+	if isPost {
 		// The concurrency slot is already held, so a client trickling its body
 		// would pin it for the full ReadTimeout. A DNS message is at most a few
 		// KiB; bound the body read tightly. Best effort: the error is ignored
@@ -817,6 +900,16 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query, qEnd, status := readDNSQuery(r, s.maxBody, s.maxEncoded)
+	if isPost {
+		// Clear the short body deadline now that the body has been read. Once
+		// the body hits EOF, net/http starts a background read on the
+		// connection to detect client disconnects; if the 2-second deadline
+		// were still armed, that read would time out while the request waits
+		// for the upstream and net/http would cancel the request context,
+		// aborting valid slow lookups with a 502. The upstream exchange is
+		// bounded by its own context (upstreamTimeout) instead.
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+	}
 	if status != 0 {
 		msg := "invalid DNS query"
 		switch status {
@@ -853,21 +946,26 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, s.maxBody+1))
+	// net/http consumes interim 1xx responses, so the final status here is
+	// always >= 200; the old < 200 arm was unreachable. RFC 8484 mandates
+	// exactly 200 for a successful DoH response, so reject anything else.
+	if resp.StatusCode != http.StatusOK {
+		drainBoundedBody(resp.Body, s.maxBody)
 		writeError(w, http.StatusBadGateway, "dns upstream returned an invalid HTTP status")
 		return
 	}
 	if !isDNSMessageContentType(resp.Header.Get("Content-Type")) {
+		drainBoundedBody(resp.Body, s.maxBody)
 		writeError(w, http.StatusBadGateway, "dns upstream returned an invalid content type")
 		return
 	}
 	if resp.ContentLength > s.maxBody {
+		drainBoundedBody(resp.Body, s.maxBody)
 		writeError(w, http.StatusBadGateway, "dns upstream response exceeds configured size limit")
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, s.maxBody+1))
+	body, tooLarge, err := readLimited(resp.Body, s.maxBody, resp.ContentLength)
 	if err != nil {
 		// The per-request deadline also covers the body read.
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -877,7 +975,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "invalid DNS response from upstream")
 		return
 	}
-	if int64(len(body)) > s.maxBody {
+	if tooLarge {
 		writeError(w, http.StatusBadGateway, "invalid DNS response from upstream")
 		return
 	}
@@ -913,10 +1011,23 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// route dispatches the catch-all "/" mux pattern: the configured DoH path, the
-// service-info root, or a JSON 404 (consistent with every other error body).
-func (s *server) route(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP dispatches on the decoded request path without ServeMux's automatic
+// dot-segment/repeated-slash redirects. This keeps unknown paths consistently
+// JSON 404s and avoids turning malformed POST paths into redirected requests.
+func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// URL.Path is decoded by net/http. Without this guard, an alternate escaped
+	// spelling such as "/%68ealth" or "/dns%2Dquery" would dispatch to the same
+	// endpoint as its canonical spelling. RawPath is set when the request's
+	// escaped path differs from Go's canonical escaping of Path; reject those
+	// aliases rather than silently normalizing them.
+	if r.URL.RawPath != "" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+
 	switch r.URL.Path {
+	case "/health":
+		s.health(w, r)
 	case s.dohPath:
 		s.doh(w, r)
 	case "/":
@@ -975,6 +1086,7 @@ func main() {
 		maxBody:      int64(maxBody),
 		maxEncoded:   base64.RawURLEncoding.EncodedLen(maxBody),
 		trustProxy:   trustProxy,
+		rateDesc:     fmt.Sprintf("%d requests/%ds per client IP", rateLimit, rateWindow),
 		started:      time.Now(),
 	}
 
@@ -994,12 +1106,8 @@ func main() {
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.health)
-	mux.HandleFunc("/", s.route)
-
 	h := &http.Server{
-		Handler:           mux,
+		Handler:           s,
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       requestReadTimeout,
 		// WriteTimeout is reset by net/http when a request's headers are

@@ -164,8 +164,8 @@ func TestValidDNSMessageRejectsForwardCompressionPointer(t *testing.T) {
 
 func TestValidDNSMessageRejectsCompressedQuestionName(t *testing.T) {
 	// A backward pointer inside the question section is invalid: compression
-	// is only permitted inside resource records. This is rejected explicitly
-	// (and, before that, only indirectly via the pointer jump cap).
+	// is only permitted inside resource records, so the question parser must
+	// reject it even when the pointer targets an earlier label.
 	qname := []byte{0x01, 'x', 0xc0, 0x0c}
 	query := queryWithQName(17, qname)
 	if validDNSMessage(query, false) {
@@ -438,8 +438,45 @@ func TestRateLimiterTracksGlobalCapacityAcrossShards(t *testing.T) {
 	}
 }
 
+func TestRateLimiterDoesNotAllocateShardMapAtCapacity(t *testing.T) {
+	r := newRateLimiter(99, 60, 64)
+	for i := 1; i <= 64; i++ {
+		ip := netip.AddrFrom4([4]byte{198, 18, byte(i / 256), byte(i)})
+		if got := r.allow(ip); got != rateAllowed {
+			t.Fatalf("client %d decision = %v, want rateAllowed", i, got)
+		}
+	}
+
+	// Select a candidate mapped to a shard that has not needed a map yet.
+	// Since the global capacity is full, this identity must be rejected
+	// without allocating that otherwise-unused map.
+	var candidate netip.Addr
+	for i := 1; i < 256; i++ {
+		ip := netip.AddrFrom4([4]byte{203, 0, 113, byte(i)})
+		idx := int(addrHash(ip) % shardCount)
+		if r.shards[idx].m == nil {
+			candidate = ip
+			break
+		}
+	}
+	if !candidate.IsValid() {
+		t.Fatal("failed to find an unused shard")
+	}
+
+	idx := int(addrHash(candidate) % shardCount)
+	if got := r.allow(candidate); got != rateCapacityReached {
+		t.Fatalf("decision = %v, want rateCapacityReached", got)
+	}
+	if r.shards[idx].m != nil {
+		t.Fatalf("shard %d map allocated for a rejected client", idx)
+	}
+	if got := r.entries.Load(); got != 64 {
+		t.Fatalf("entries = %d, want 64", got)
+	}
+}
+
 func TestPortConfigurationFallsBackForInvalidValues(t *testing.T) {
-	for _, value := range []string{"not-a-port", "0", "65536", "-1"} {
+	for _, value := range []string{"not-a-port", "0", "65536", "-1", "+8080", "+0"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("PORT", value)
 			if got := getenvInt("PORT", defaultPort, 1, 65535); got != defaultPort {
@@ -644,6 +681,20 @@ func TestDoHRejectsOversizedRawQueryBeforeParsing(t *testing.T) {
 	}
 }
 
+func TestDoHOversizedSemicolonQueryUsesFastFail(t *testing.T) {
+	// A semicolon is not a tolerated separator: url.ParseQuery rejects query
+	// settings containing one, so an oversized separator-free query must hit
+	// the 414 fast-fail instead of being parsed into a 400 first.
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	long := strings.Repeat("a", defaultMaxGetQuerySize+len("dns=")+1) + ";"
+	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?"+long, nil)
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusRequestURITooLong {
+		t.Fatalf("status = %d, want 414", rec.Code)
+	}
+}
+
 func TestReadDNSQueryAcceptsValidDNSWithExtraParametersPastFastFailThreshold(t *testing.T) {
 	query := testQuery(36)
 	encoded := base64.RawURLEncoding.EncodeToString(query)
@@ -793,8 +844,12 @@ func TestDoHRejectsUpstreamResponseLargerThanConfiguredLimit(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
 	}
-	if body.read {
-		t.Fatal("oversized upstream response body was read despite Content-Length")
+	// The rejected body is drained (bounded by the configured limit) before the
+	// gateway replies, so the upstream connection can be reused instead of
+	// closed. This mirrors the advertised-oversized-request path, where the
+	// client body must NOT be read.
+	if !body.read {
+		t.Fatal("oversized upstream response body was not drained for connection reuse")
 	}
 }
 
@@ -1044,6 +1099,26 @@ func TestDoHRejectsNonSuccessUpstreamStatus(t *testing.T) {
 	}
 }
 
+func TestDoHRejectsNonOKUpstreamStatus(t *testing.T) {
+	// RFC 8484 mandates exactly HTTP 200 for a successful DoH response. A 204
+	// from the upstream must be rejected like any other non-200 status.
+	query := testQuery(41)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	s := newTestGateway(upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader(string(query)))
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.doh(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+}
+
 func TestDoHRejectsOversizedUpstreamResponse(t *testing.T) {
 	query := testQuery(8)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1210,7 +1285,7 @@ func TestRouteDispatchesPathsAndReturnsJSON404(t *testing.T) {
 	s := newTestGateway("http://127.0.0.1:9/dns-query")
 
 	rec := httptest.NewRecorder()
-	s.route(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown path status = %d, want 404", rec.Code)
 	}
@@ -1219,15 +1294,52 @@ func TestRouteDispatchesPathsAndReturnsJSON404(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	s.route(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("root status = %d, want 200", rec.Code)
 	}
 
 	rec = httptest.NewRecorder()
-	s.route(rec, httptest.NewRequest(http.MethodPut, defaultDoHPath, nil))
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, defaultDoHPath, nil))
 	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET, POST" {
 		t.Fatalf("DoH path dispatch: status=%d Allow=%q, want 405 and %q", rec.Code, rec.Header().Get("Allow"), "GET, POST")
+	}
+}
+
+func TestServeHTTPDoesNotRedirectNonCanonicalPaths(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	for _, requestPath := range []string{
+		"/unknown//path",
+		"/unknown/../dns-query",
+		"/dns-query//",
+		"/%68ealth",    // encoded spelling of a reserved endpoint
+		"/dns%2Dquery", // encoded spelling of the configured DoH endpoint
+	} {
+		t.Run(requestPath, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, requestPath, strings.NewReader("ignored")))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Location"); got != "" {
+				t.Fatalf("unexpected redirect Location %q", got)
+			}
+			if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+				t.Fatalf("Content-Type = %q, want JSON", got)
+			}
+		})
+	}
+}
+
+func TestServeHTTPAllowsCanonicalEscapingForConfiguredPath(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	s.dohPath = "/doh path"
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/doh%20path", nil))
+	// The configured path contains a space, so its canonical URL spelling is
+	// percent-escaped. It should reach DoH validation, not become a 404.
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("canonical escaped path status = %d, want 400 from missing dns parameter; body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1278,5 +1390,40 @@ func TestValidDNSMessageNameLengthBoundary(t *testing.T) {
 	}
 	if validDNSMessage(queryWithQName(51, build(62)), false) {
 		t.Fatal("expected a 256-byte wire-format name to be rejected")
+	}
+}
+
+func TestRateLimiterKeepsMappedIPv4ClientsSeparate(t *testing.T) {
+	// IPv4-mapped IPv6 addresses must not collapse into a single /64 key.
+	r := newRateLimiter(1, 60, 64)
+	a := netip.MustParseAddr("::ffff:192.0.2.1")
+	b := netip.MustParseAddr("::ffff:192.0.2.2")
+	if r.allow(a) != rateAllowed || r.allow(b) != rateAllowed {
+		t.Fatal("distinct mapped IPv4 clients must have independent quotas")
+	}
+	if r.allow(netip.MustParseAddr("192.0.2.1")) == rateAllowed {
+		t.Fatal("mapped and plain spellings of one IPv4 client must share a quota")
+	}
+}
+
+func TestReadLimited(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		in       string
+		limit    int64
+		hint     int64
+		want     string
+		tooLarge bool
+	}{
+		{"within limit, no hint", "abcd", 4, -1, "abcd", false},
+		{"within limit, exact hint", "abcd", 4, 4, "abcd", false},
+		{"over limit", "abcde", 4, -1, "", true},
+		{"hint larger than limit is ignored", "ab", 4, 1 << 40, "ab", false},
+		{"lying small hint", "abcd", 4, 1, "abcd", false},
+	} {
+		got, tooLarge, err := readLimited(strings.NewReader(tc.in), tc.limit, tc.hint)
+		if err != nil || tooLarge != tc.tooLarge || string(got) != tc.want {
+			t.Errorf("%s: got (%q, %t, %v), want (%q, %t, nil)", tc.name, got, tooLarge, err, tc.want, tc.tooLarge)
+		}
 	}
 }
