@@ -11,10 +11,6 @@ RUN set -eux; cd /build/gateway; go test ./...; go vet ./...; go build -trimpath
 RUN set -eux; openssl req -x509 -nodes -newkey rsa:2048 -days 5000 -sha256 -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' -keyout /out/localhost.pem -out /out/localhost.pem
 FROM alpine:3.24.2 AS runtime
 RUN apk add --no-cache ca-certificates tini && addgroup -S doh && adduser -S -D -H -G doh doh
-# Permissions and ownership are set by COPY itself. A separate RUN chmod/chown
-# would copy every touched file into a new layer and roughly double the size of
-# the two binaries in the final image. (Requires BuildKit, which this
-# Dockerfile already needs for TARGETARCH.)
 COPY --from=build --chmod=0755 /out/dnscrypt-proxy /usr/local/bin/dnscrypt-proxy
 COPY --from=build --chmod=0755 /out/doh-gateway /usr/local/bin/doh-gateway
 COPY --from=build --chown=doh:doh --chmod=0600 /out/localhost.pem /etc/localhost.pem
@@ -23,8 +19,6 @@ COPY --chmod=0755 entrypoint.sh /entrypoint.sh
 ENV GOMAXPROCS=1 GOMEMLIMIT=160MiB PORT=8080 DOH_PATH=/dns-query RATE_LIMIT=99 RATE_WINDOW_SECONDS=60 MAX_DNS_MESSAGE_BYTES=8192 MAX_CONCURRENCY=16 MAX_CLIENT_IPS=8192 TRUST_PROXY_HEADERS=true
 EXPOSE 8080
 USER doh
-# Mirror getenvInt's PORT fallback so an invalid runtime PORT does not make
-# the health check probe a different port from the gateway.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 CMD \
     port="${PORT:-8080}"; \
     port="$(printf '%s' "$port" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"; \
