@@ -9,24 +9,21 @@ services:
     # container) instead of silently diverging from it.
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
-    # TRUST_PROXY_HEADERS is deliberately NOT listed in an environment: block:
-    # an explicit mapping there would take precedence over .env and silently
-    # ignore TRUST_PROXY_HEADERS=false for local development. Instead the
-    # image's baked-in ENV default ("true") applies — matching the SnapDeploy
-    # deployment, whose managed edge terminates TLS and overwrites
-    # CF-Connecting-IP / X-Forwarded-For before the gateway sees them — and
-    # env_file passes a .env value straight through when you need to override
-    # it. If you publish the port directly with no such edge in front, set
-    # TRUST_PROXY_HEADERS=false in .env: trusting spoofable headers in that
-    # setup would let any client bypass the per-IP rate limit.
-    # Optional local overrides (copy .env.example to .env). The "required: true"
+    # Optional local overrides (copy .env.example to .env). The "required: false"
     # env_file syntax needs Docker Compose 2.24 or newer.
     env_file:
       - path: .env
         required: false
     # Compose interpolation does not automatically pass shell variables into
-    # the container. Explicitly pass the resolved PORT so the listener and the
-    # published container port cannot diverge when the shell overrides .env.
+    # the container, so these two are passed explicitly:
+    # - PORT keeps the listener and the published container port from
+    #   diverging when the shell overrides .env.
+    # - TRUST_PROXY_HEADERS defaults to false here even though the image
+    #   defaults to true for SnapDeploy's managed edge, because Compose
+    #   publishes the port directly. Set it to true only when a trusted proxy
+    #   overwrites forwarding headers; spoofed headers can bypass per-IP rate
+    #   limits on a directly reachable port.
     environment:
       PORT: "${PORT:-8080}"
+      TRUST_PROXY_HEADERS: "${TRUST_PROXY_HEADERS:-false}"
     restart: unless-stopped

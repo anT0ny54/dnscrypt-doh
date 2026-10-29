@@ -72,6 +72,13 @@ func queryWithAdditional(id byte, rtype uint16) []byte {
 	return body
 }
 
+func queryWithOPTOptions(id byte, options []byte) []byte {
+	body := queryWithAdditional(id, dnsTypeOPT)
+	body[38] = byte(len(options) >> 8)
+	body[39] = byte(len(options))
+	return append(body, options...)
+}
+
 type trackingBody struct {
 	read bool
 }
@@ -163,6 +170,51 @@ func TestValidDNSMessageRejectsCompressedQuestionName(t *testing.T) {
 	query := queryWithQName(17, qname)
 	if validDNSMessage(query, false) {
 		t.Fatal("expected compressed question name to be rejected")
+	}
+}
+
+func TestValidDNSMessageAcceptsHighBytesInsideQuestionLabel(t *testing.T) {
+	// Only label-length octets can introduce compression pointers. Bytes in
+	// the label payload are arbitrary DNS name octets, even when >= 0xc0.
+	qname := []byte{0x03, 'a', 0xc0, 0xff, 0x00}
+	query := queryWithQName(18, qname)
+	if !validDNSMessage(query, false) {
+		t.Fatal("expected high bytes inside an uncompressed label to be accepted")
+	}
+}
+
+func TestValidDNSMessageValidatesEDNSOptionFraming(t *testing.T) {
+	for name, options := range map[string][]byte{
+		"truncated option header": {0x00, 0x01, 0x00},
+		"truncated option data":   {0x00, 0x01, 0x00, 0x02, 0xaa},
+	} {
+		t.Run(name, func(t *testing.T) {
+			query := queryWithOPTOptions(42, options)
+			if validDNSMessage(query, false) {
+				t.Fatal("expected malformed EDNS option framing to be rejected")
+			}
+		})
+	}
+
+	validOptions := []byte{0x00, 0x01, 0x00, 0x02, 0xaa, 0xbb}
+	if !validDNSMessage(queryWithOPTOptions(43, validOptions), false) {
+		t.Fatal("expected a well-formed EDNS option to be accepted")
+	}
+}
+
+func TestValidDNSResponseRejectsMalformedEDNSOptionFraming(t *testing.T) {
+	response := testResponse(testQuery(44))
+	response[11] = 1 // ARCOUNT = 1; append a final OPT record.
+	response = append(response, []byte{
+		0x00,       // root owner name
+		0x00, 0x29, // OPT (41)
+		0x10, 0x00, // UDP payload size
+		0x00, 0x00, 0x00, 0x00, // extended RCODE, version, flags
+		0x00, 0x03, // RDLENGTH = 3, too short for an option header
+		0x00, 0x01, 0x00,
+	}...)
+	if validDNSMessage(response, true) {
+		t.Fatal("expected malformed upstream EDNS option framing to be rejected")
 	}
 }
 
@@ -579,10 +631,9 @@ func TestDoHRejectsDuplicateGETDNSParameters(t *testing.T) {
 }
 
 func TestDoHRejectsOversizedRawQueryBeforeParsing(t *testing.T) {
-	// A query string longer than the encoded ceiling plus a "dns=" prefix is
-	// rejected with 414 before parsing. Without the fast-fail it would parse
-	// fine (one giant valueless parameter) and fail later as a 400, but the
-	// gateway must not spend parse work on a request that cannot succeed.
+	// A long raw query without parameter separators is rejected with 414
+	// before parsing. Without the fast-fail it would parse as one giant
+	// valueless parameter and then fail as a 400 because it has no dns value.
 	s := newTestGateway("http://127.0.0.1:9/dns-query")
 	long := strings.Repeat("a", defaultMaxGetQuerySize+len("dns=")+1)
 	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?"+long, nil)
@@ -593,6 +644,23 @@ func TestDoHRejectsOversizedRawQueryBeforeParsing(t *testing.T) {
 	}
 }
 
+func TestReadDNSQueryAcceptsValidDNSWithExtraParametersPastFastFailThreshold(t *testing.T) {
+	query := testQuery(36)
+	encoded := base64.RawURLEncoding.EncodeToString(query)
+	rawQuery := "dns=" + encoded + "&extra=" + strings.Repeat("x", defaultMaxGetQuerySize+1)
+	if len(rawQuery) <= defaultMaxGetQuerySize+len("dns=") {
+		t.Fatal("test query must exceed the oversized-query fast-fail threshold")
+	}
+	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?"+rawQuery, nil)
+	got, _, status := readDNSQuery(req, defaultMaxBodyBytes, base64.RawURLEncoding.EncodedLen(defaultMaxBodyBytes))
+	if status != 0 {
+		t.Fatalf("status = %d, want success for a valid dns parameter with an extra parameter", status)
+	}
+	if !bytes.Equal(got, query) {
+		t.Fatal("decoded DNS query does not match the original message")
+	}
+}
+
 func TestDoHRejectsMalformedGETQueryString(t *testing.T) {
 	s := newTestGateway("http://127.0.0.1:9/dns-query")
 	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?dns=%zz", nil)
@@ -600,6 +668,15 @@ func TestDoHRejectsMalformedGETQueryString(t *testing.T) {
 	s.doh(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestReadDNSQueryRejectsBase64URLLineBreaks(t *testing.T) {
+	encoded := base64.RawURLEncoding.EncodeToString(testQuery(35))
+	mid := len(encoded) / 2
+	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?dns="+encoded[:mid]+"%0A"+encoded[mid:], nil)
+	if _, _, status := readDNSQuery(req, defaultMaxBodyBytes, base64.RawURLEncoding.EncodedLen(defaultMaxBodyBytes)); status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a line break inside the base64url value", status)
 	}
 }
 
@@ -1166,7 +1243,10 @@ func TestProbeUpstreamBoundedByDeadline(t *testing.T) {
 	go func() {
 		c, err := ln.Accept()
 		if err == nil {
-			time.Sleep(2 * time.Second)
+			// Keep the peer silent during the TLS handshake, then exit as soon
+			// as the probe's deadline closes the client connection. A fixed
+			// sleep would leave this goroutine and socket alive after the test.
+			_, _ = io.Copy(io.Discard, c)
 			_ = c.Close()
 		}
 	}()
@@ -1178,5 +1258,25 @@ func TestProbeUpstreamBoundedByDeadline(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > upstreamProbeTimeout+500*time.Millisecond {
 		t.Fatalf("probe took %s, want it bounded by the %s probe timeout", elapsed, upstreamProbeTimeout)
+	}
+}
+
+func TestValidDNSMessageNameLengthBoundary(t *testing.T) {
+	// Three 63-byte labels (192 bytes) plus a final label plus the root label.
+	build := func(lastLabel int) []byte {
+		var qname []byte
+		for i := 0; i < 3; i++ {
+			qname = append(qname, 63)
+			qname = append(qname, bytes.Repeat([]byte{'a'}, 63)...)
+		}
+		qname = append(qname, byte(lastLabel))
+		qname = append(qname, bytes.Repeat([]byte{'a'}, lastLabel)...)
+		return append(qname, 0)
+	}
+	if !validDNSMessage(queryWithQName(50, build(61)), false) {
+		t.Fatal("expected a 255-byte wire-format name to be accepted")
+	}
+	if validDNSMessage(queryWithQName(51, build(62)), false) {
+		t.Fatal("expected a 256-byte wire-format name to be rejected")
 	}
 }

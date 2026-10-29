@@ -23,5 +23,13 @@ COPY --chmod=0755 entrypoint.sh /entrypoint.sh
 ENV GOMAXPROCS=1 GOMEMLIMIT=160MiB PORT=8080 DOH_PATH=/dns-query RATE_LIMIT=99 RATE_WINDOW_SECONDS=60 MAX_DNS_MESSAGE_BYTES=8192 MAX_CONCURRENCY=8 MAX_CLIENT_IPS=8192 TRUST_PROXY_HEADERS=true
 EXPOSE 8080
 USER doh
-HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 CMD wget -q -O - http://127.0.0.1:${PORT}/health >/dev/null || exit 1
+# Mirror getenvInt's PORT fallback so an invalid runtime PORT does not make
+# the health check probe a different port from the gateway.
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 CMD \
+    port="${PORT:-8080}"; \
+    port="$(printf '%s' "$port" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"; \
+    case "$port" in +*) port="${port#+}";; esac; \
+    case "$port" in ""|*[!0-9]*) port=8080;; esac; \
+    if ! [ "$port" -ge 1 ] 2>/dev/null || ! [ "$port" -le 65535 ] 2>/dev/null; then port=8080; fi; \
+    wget -q -O - "http://127.0.0.1:${port}/health" >/dev/null
 ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]

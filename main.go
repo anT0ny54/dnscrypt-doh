@@ -380,10 +380,6 @@ func isDNSMessageContentType(v string) bool {
 // dnsNameEnd validates a DNS name, including compression pointers, and returns
 // the number of bytes consumed at the containing offset.
 func dnsNameEnd(msg []byte, offset int) (int, bool) {
-	if offset < 0 || offset >= len(msg) {
-		return 0, false
-	}
-
 	next := offset
 	jumped := false
 	jumps := 0
@@ -437,10 +433,63 @@ func dnsNameEnd(msg []byte, offset int) (int, bool) {
 	}
 }
 
-// parseDNSMessage validates a DNS message and also returns qEnd, the offset
-// just past the question section (QNAME + QTYPE + QCLASS). Callers that have
-// validated a message can slice msg[12:qEnd] to compare question sections
-// without re-parsing them. On failure qEnd is 0.
+// dnsNameEndUncompressed validates an uncompressed DNS name and returns the
+// offset just after it. It inspects label-length octets only, so arbitrary
+// bytes inside a label (including 0xc0-0xff) are not mistaken for pointers.
+func dnsNameEndUncompressed(msg []byte, offset int) (int, bool) {
+	nameLen := 0
+	for {
+		if offset >= len(msg) {
+			return 0, false
+		}
+		labelLen := msg[offset]
+		if labelLen == 0 {
+			// The label branch below rejects any name whose labels already
+			// total 255 bytes, so nameLen+1 (the root label) is at most 255
+			// here and needs no further length check.
+			return offset + 1, true
+		}
+		// Question names must be uncompressed. The 0x40 and 0x80 label forms
+		// are reserved, and 0xc0 begins a compression pointer.
+		if labelLen&0xc0 != 0 {
+			return 0, false
+		}
+		labelSize := int(labelLen)
+		if offset+1+labelSize > len(msg) {
+			return 0, false
+		}
+		nameLen += 1 + labelSize
+		if nameLen >= maxDNSNameBytes {
+			// A terminating root label must also fit within the 255-byte limit.
+			return 0, false
+		}
+		offset += 1 + labelSize
+	}
+}
+
+// validEDNSOptions checks the TLV framing of an EDNS(0) OPT record's RDATA.
+// Each option contains a 2-byte code, a 2-byte length, and exactly that many
+// option-data bytes. Unknown option codes remain valid and are kept opaque.
+// The caller guarantees start <= end <= len(msg).
+func validEDNSOptions(msg []byte, start, end int) bool {
+	for start < end {
+		if end-start < 4 {
+			return false
+		}
+		optionLen := int(binary.BigEndian.Uint16(msg[start+2 : start+4]))
+		start += 4
+		if optionLen > end-start {
+			return false
+		}
+		start += optionLen
+	}
+	return true
+}
+
+// parseDNSMessage validates the DNS message structure and also returns qEnd,
+// the offset just past the question section (QNAME + QTYPE + QCLASS). Callers
+// can slice msg[12:qEnd] to compare validated question sections without
+// re-parsing them. On failure qEnd is 0.
 func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 	if len(msg) < 12 {
 		return 0, false
@@ -468,24 +517,12 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 	}
 
 	// qdCount was required to be exactly one above, so parse the single
-	// question directly instead of looping over a count that cannot repeat.
-	offset, nameOK := dnsNameEnd(msg, 12)
+	// uncompressed question directly instead of looping over a count that
+	// cannot repeat. Only label-length octets determine name encoding; bytes
+	// inside a label are arbitrary and must not be scanned for pointer markers.
+	offset, nameOK := dnsNameEndUncompressed(msg, 12)
 	if !nameOK || offset+4 > len(msg) {
 		return 0, false
-	}
-	// The question name must be uncompressed: compression pointers are only
-	// valid inside resource records. Today any pointer here would still be
-	// rejected indirectly (a question pointer can only target bytes inside
-	// the name being parsed, which the jump cap above rejects as a loop), but
-	// enforcing it explicitly documents the invariant dnsQuestionEqual relies
-	// on and avoids that 128-step loop. A 0xc0 byte inside this span is
-	// necessarily a pointer: dnsNameEnd already rejected 0x40/0x80 label
-	// lengths, and a pointer that starts the jump still lies in this span
-	// because dnsNameEnd returns the offset just past it.
-	for i := 12; i < offset; i++ {
-		if msg[i]&0xc0 == 0xc0 {
-			return 0, false
-		}
 	}
 	offset += 4 // QTYPE + QCLASS
 	qEnd = offset
@@ -500,11 +537,12 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 			ownerEnd := offset
 			rtype := binary.BigEndian.Uint16(msg[offset : offset+2])
 			rdataLen := int(binary.BigEndian.Uint16(msg[offset+8 : offset+10]))
-			offset += 10
-			if offset+rdataLen > len(msg) {
+			rdataStart := offset + 10
+			if rdataStart+rdataLen > len(msg) {
 				return 0, false
 			}
-			offset += rdataLen
+			rdataEnd := rdataStart + rdataLen
+			offset = rdataEnd
 
 			if !wantResponse && rtype != dnsTypeOPT {
 				return 0, false
@@ -518,6 +556,9 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 				// each need at least two bytes, so an explicit zero-byte test
 				// would be unreachable.
 				if section != 2 || i != sectionCount-1 || ownerEnd != recordStart+1 {
+					return 0, false
+				}
+				if !validEDNSOptions(msg, rdataStart, rdataEnd) {
 					return 0, false
 				}
 			}
@@ -590,15 +631,15 @@ func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, 
 		}
 		msg = body
 	} else {
-		// Fail fast: a query string longer than the absolute encoded ceiling
-		// plus the shortest possible "dns=" prefix cannot yield an acceptable
-		// dns parameter, so reject it before parsing. (The request line is
-		// already bounded by the server's MaxHeaderBytes; this only skips
-		// parse work on requests that cannot succeed.)
-		if len(r.URL.RawQuery) > defaultMaxGetQuerySize+len("dns=") {
+		// Fail fast only when a long raw query has no parameter separator.
+		// Extra parameters are tolerated, so the total query may exceed the DNS
+		// encoding ceiling while its dns value remains valid. MaxHeaderBytes
+		// bounds the amount of query data parsed when multiple parameters exist.
+		rawQuery := r.URL.RawQuery
+		if len(rawQuery) > defaultMaxGetQuerySize+len("dns=") && !strings.ContainsAny(rawQuery, "&;") {
 			return nil, 0, http.StatusRequestURITooLong
 		}
-		values, err := url.ParseQuery(r.URL.RawQuery)
+		values, err := url.ParseQuery(rawQuery)
 		if err != nil {
 			return nil, 0, http.StatusBadRequest
 		}
@@ -609,6 +650,12 @@ func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, 
 		encoded := dnsValues[0]
 		if len(encoded) > maxEncoded || len(encoded) > defaultMaxGetQuerySize {
 			return nil, 0, http.StatusRequestURITooLong
+		}
+		// Go's base64 decoder ignores CR and LF, but raw base64url values in
+		// RFC 8484 query parameters must not contain line breaks. Reject them
+		// before decoding so malformed input cannot be silently normalized.
+		if strings.ContainsAny(encoded, "\r\n") {
+			return nil, 0, http.StatusBadRequest
 		}
 		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
 		if err != nil {
@@ -715,7 +762,8 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 }
 
 // unavailableRetryAfter1 answers 503 with a one-second Retry-After hint. The
-// client-table-capacity and invalid-client-IP paths share this response.
+// concurrency-gate, client-table-capacity and invalid-client-IP paths share
+// this response.
 func unavailableRetryAfter1(w http.ResponseWriter, msg string) {
 	w.Header().Set("Retry-After", "1")
 	writeError(w, http.StatusServiceUnavailable, msg)
@@ -739,8 +787,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	default:
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusServiceUnavailable, "server concurrency limit reached")
+		unavailableRetryAfter1(w, "server concurrency limit reached")
 		return
 	}
 
