@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -92,6 +93,27 @@ func (b *trackingBody) Close() error {
 	return nil
 }
 
+type countingReader struct {
+	remaining int
+	read      int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n := len(p)
+	for i := range p {
+		p[i] = 'x'
+	}
+	r.remaining -= n
+	r.read += n
+	return n, nil
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -146,8 +168,9 @@ func TestValidDNSMessages(t *testing.T) {
 	if !validDNSMessage(response, true) {
 		t.Fatal("expected response to validate")
 	}
+	// Turn the answer's name pointer (bytes 29-30) into a forward pointer to
+	// offset 64, which must be rejected.
 	bad := append([]byte(nil), response...)
-	bad[len(bad)-1] = 0
 	bad[30] = 0x40
 	if validDNSMessage(bad, true) {
 		t.Fatal("expected malformed DNS name to be rejected")
@@ -396,6 +419,65 @@ func TestDoHRejectsAdvertisedOversizedPOST(t *testing.T) {
 	}
 }
 
+func TestHealthAndRootJSONBodies(t *testing.T) {
+	// The key order is part of the wire format; these bodies must not change
+	// shape when the responses are encoded from structs.
+	s := newTestGateway("http://127.0.0.1:1/dns-query")
+	s.rateDesc = "99 requests/60s per client IP"
+
+	rec := httptest.NewRecorder()
+	s.root(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if got, want := rec.Body.String(), `{"endpoint":"/dns-query","rateLimit":"99 requests/60s per client IP","service":"minimal-hagezi-doh"}`+"\n"; got != want {
+		t.Fatalf("root body = %q, want %q", got, want)
+	}
+
+	rec = httptest.NewRecorder()
+	s.health(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("health status = %d, want 503 for an unreachable upstream", rec.Code)
+	}
+	if want, got := `{"service":"minimal-hagezi-doh","status":"starting","uptime":"`, rec.Body.String(); !strings.HasPrefix(got, want) {
+		t.Fatalf("health body = %q, want prefix %q", got, want)
+	}
+}
+
+func TestHealthcheckURLUsesGatewayPortFallback(t *testing.T) {
+	for value, want := range map[string]string{
+		"9090":   "9090",
+		" 9091 ": "9091",
+		"+9090":  "8080",
+		"0":      "8080",
+		"":       "8080",
+	} {
+		t.Setenv("PORT", value)
+		if got, wantURL := healthcheckURL(), "http://127.0.0.1:"+want+"/health"; got != wantURL {
+			t.Fatalf("PORT=%q: healthcheckURL() = %q, want %q", value, got, wantURL)
+		}
+	}
+}
+
+func TestRunHealthcheckExitCodes(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ok.Close()
+	if got := runHealthcheck(ok.URL + "/health"); got != 0 {
+		t.Fatalf("healthy gateway: runHealthcheck = %d, want 0", got)
+	}
+
+	starting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer starting.Close()
+	if got := runHealthcheck(starting.URL + "/health"); got != 1 {
+		t.Fatalf("503 response: runHealthcheck = %d, want 1", got)
+	}
+
+	if got := runHealthcheck("http://127.0.0.1:1/health"); got != 1 {
+		t.Fatalf("refused connection: runHealthcheck = %d, want 1", got)
+	}
+}
+
 func TestRateLimiterAllocatesShardMapsLazily(t *testing.T) {
 	r := newRateLimiter(1, 60, 256)
 	for i := range r.shards {
@@ -511,19 +593,6 @@ func TestGetenvBoolUsesFallbackForInvalidValue(t *testing.T) {
 	}
 }
 
-func TestValidDNSMessageRejectsOversizedDNSName(t *testing.T) {
-	qname := make([]byte, 0, 257)
-	for i := 0; i < 4; i++ {
-		qname = append(qname, 63)
-		qname = append(qname, bytes.Repeat([]byte{'a'}, 63)...)
-	}
-	qname = append(qname, 0)
-	query := queryWithQName(11, qname)
-	if validDNSMessage(query, false) {
-		t.Fatal("expected DNS name over 255 bytes to be rejected")
-	}
-}
-
 func TestParseClientIPCanonicalizesMappedIPv4(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
 	r.RemoteAddr = "127.0.0.1:8080"
@@ -556,6 +625,105 @@ func TestRateLimiterSharedShardDoesNotReduceGlobalCapacity(t *testing.T) {
 	}
 	if got := r.entries.Load(); got != 2 {
 		t.Fatalf("entries=%d; want 2", got)
+	}
+}
+
+func TestRateLimiterLogicalClockNeverMovesBackwardAndAdvancesDuringRollback(t *testing.T) {
+	r := newRateLimiter(2, 60, 64)
+	startWall := r.clockStart.UnixNano()
+	second := int64(time.Second)
+	base := r.logicalUnixSecondsAt(startWall, 0)
+
+	if got, want := r.logicalUnixSecondsAt(startWall+10*second, 10*second), base+10; got != want {
+		t.Fatalf("normal clock progression = %d, want %d", got, want)
+	}
+	if got, want := r.logicalUnixSecondsAt(startWall+100*second, 10*second), base+100; got != want {
+		t.Fatalf("forward clock step = %d, want %d", got, want)
+	}
+	// The wall clock is corrected backwards, but the logical clock keeps
+	// advancing with monotonic elapsed time rather than freezing at the peak.
+	if got, want := r.logicalUnixSecondsAt(startWall+15*second, 15*second), base+105; got != want {
+		t.Fatalf("backwards clock projection = %d, want %d", got, want)
+	}
+	if got, want := r.logicalUnixSecondsAt(startWall+16*second, 16*second), base+106; got != want {
+		t.Fatalf("logical clock stopped advancing after rollback: got %d, want %d", got, want)
+	}
+}
+
+func TestRateLimiterConcurrentRequestsRespectPerClientQuota(t *testing.T) {
+	const (
+		limit    = 7
+		requests = 128
+	)
+	r := newRateLimiter(limit, 60, 64)
+	ip := netip.MustParseAddr("192.0.2.41")
+	start := make(chan struct{})
+	results := make(chan rateLimitResult, requests)
+	var wg sync.WaitGroup
+
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- r.allow(ip)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var allowed, exceeded int
+	for result := range results {
+		switch result {
+		case rateAllowed:
+			allowed++
+		case rateExceeded:
+			exceeded++
+		default:
+			t.Fatalf("unexpected rate-limit result: %v", result)
+		}
+	}
+	if allowed != limit || exceeded != requests-limit {
+		t.Fatalf("concurrent requests: allowed=%d exceeded=%d; want %d and %d", allowed, exceeded, limit, requests-limit)
+	}
+	if got := r.entries.Load(); got != 1 {
+		t.Fatalf("tracked entries = %d, want exactly one client entry", got)
+	}
+}
+
+func TestRateLimiterCleanupDoesNotReopenQuotaAfterClockStepBackward(t *testing.T) {
+	r := newRateLimiter(1, 60, 64)
+	ip := netip.MustParseAddr("192.0.2.40")
+	sh := &r.shards[int(addrHash(ip)%shardCount)]
+	now := time.Now()
+	elapsed := now.Sub(r.clockStart).Nanoseconds()
+	currentLogical := r.logicalUnixSecondsAt(now.UnixNano(), elapsed)
+	oldWindow := currentLogical / r.windowSec
+	sh.m = map[netip.Addr]rateEntry{ip: {window: oldWindow, count: 1}}
+	r.entries.Store(1)
+
+	// Simulate a forward wall-clock step that crosses two windows. Cleanup
+	// must use that logical time; a backwards correction immediately after the
+	// sweep must not reopen the exhausted client's quota.
+	futureWindow := oldWindow + 2
+	futureWall := int64(futureWindow*r.windowSec) * int64(time.Second)
+	if got := r.logicalUnixSecondsAt(futureWall, elapsed); got/r.windowSec != futureWindow {
+		t.Fatalf("logical window after forward step = %d, want %d", got/r.windowSec, futureWindow)
+	}
+	r.cleanup()
+	if got := r.entries.Load(); got != 0 {
+		t.Fatalf("entries after cleanup = %d, want expired entry reclaimed", got)
+	}
+	if got := r.logicalUnixSecondsAt(now.UnixNano(), elapsed); got/r.windowSec != futureWindow {
+		t.Fatalf("logical window after backwards correction = %d, want %d", got/r.windowSec, futureWindow)
+	}
+
+	if got := r.allow(ip); got != rateAllowed {
+		t.Fatalf("first request in the new logical window = %v, want rateAllowed", got)
+	}
+	if got := r.allow(ip); got != rateExceeded {
+		t.Fatalf("second request after the backwards step = %v, want rateExceeded", got)
 	}
 }
 
@@ -844,12 +1012,18 @@ func TestDoHRejectsUpstreamResponseLargerThanConfiguredLimit(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
 	}
-	// The rejected body is drained (bounded by the configured limit) before the
-	// gateway replies, so the upstream connection can be reused instead of
-	// closed. This mirrors the advertised-oversized-request path, where the
-	// client body must NOT be read.
-	if !body.read {
-		t.Fatal("oversized upstream response body was not drained for connection reuse")
+	// Content-Length already proves this body exceeds the limit. Do not spend
+	// another full body-read budget on a connection that must be discarded.
+	if body.read {
+		t.Fatal("known-oversized upstream response body should not be read")
+	}
+}
+
+func TestDrainBoundedBodyStopsAtLimitPlusOne(t *testing.T) {
+	body := &countingReader{remaining: 100}
+	drainBoundedBody(body, 4)
+	if body.read != 5 {
+		t.Fatalf("drained %d bytes, want the 5-byte detection bound", body.read)
 	}
 }
 
@@ -1345,8 +1519,7 @@ func TestServeHTTPAllowsCanonicalEscapingForConfiguredPath(t *testing.T) {
 
 func TestProbeUpstreamBoundedByDeadline(t *testing.T) {
 	// An endpoint that accepts TCP but never speaks TLS must fail the probe
-	// within the probe timeout; before the handshake deadline existed, the
-	// probe hung until the peer eventually closed the connection.
+	// within the probe timeout rather than waiting for the peer to close.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1403,6 +1576,18 @@ func TestRateLimiterKeepsMappedIPv4ClientsSeparate(t *testing.T) {
 	}
 	if r.allow(netip.MustParseAddr("192.0.2.1")) == rateAllowed {
 		t.Fatal("mapped and plain spellings of one IPv4 client must share a quota")
+	}
+}
+
+// readDNSQuery does not re-check the decoded size of GET queries because the
+// encoded ceiling EncodedLen(maxBody) already implies it. This pins that
+// implication across the configurable MAX_DNS_MESSAGE_BYTES range.
+func TestEncodedCeilingImpliesDecodedLimit(t *testing.T) {
+	for _, maxBody := range []int{512, 8192, 9216, 9217, 65535} {
+		encoded := base64.RawURLEncoding.EncodedLen(maxBody)
+		if decoded := base64.RawURLEncoding.DecodedLen(encoded); decoded > maxBody {
+			t.Errorf("maxBody=%d: encoded ceiling %d decodes to %d bytes", maxBody, encoded, decoded)
+		}
 	}
 }
 

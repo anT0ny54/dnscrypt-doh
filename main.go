@@ -42,26 +42,26 @@ const (
 	// GET query is rejected with 414 before parsing. "&" is the only separator
 	// tolerated here: url.ParseQuery rejects query settings containing ";",
 	// so a semicolon must not let an oversized query bypass the fast-fail.
-	maxGetQueryFastFail    = defaultMaxGetQuerySize + len("dns=")
-	minMaxBodyBytes        = 512
-	maxMaxBodyBytes        = 65535
-	maxRateLimit           = 1000000
-	maxRateWindowSec       = 86400
-	maxConcurrency         = 16
-	maxClientEntries       = 32768
-	maxDNSNameBytes        = 255
-	maxDNSRecords          = 4096
-	dnsTypeOPT             = 41
-	dnsOpcodeMask          = 0x7800
-	shardCount             = 64
-	upstreamTimeout        = 6 * time.Second
-	requestReadTimeout     = 7 * time.Second
-	bodyReadTimeout        = 2 * time.Second
-	responseWriteTimeout   = requestReadTimeout + upstreamTimeout
-	upstreamProbeTimeout   = 500 * time.Millisecond
-	upstreamProbeCacheTTL  = 2 * time.Second
-	shutdownGrace          = 5 * time.Second
-	maxCleanupIntervalSec  = 30
+	maxGetQueryFastFail   = defaultMaxGetQuerySize + len("dns=")
+	minMaxBodyBytes       = 512
+	maxMaxBodyBytes       = 65535
+	maxRateLimit          = 1000000
+	maxRateWindowSec      = 86400
+	maxConcurrency        = 16
+	maxClientEntries      = 32768
+	maxDNSNameBytes       = 255
+	maxDNSRecords         = 4096
+	dnsTypeOPT            = 41
+	dnsOpcodeMask         = 0x7800
+	shardCount            = 64
+	upstreamTimeout       = 6 * time.Second
+	requestReadTimeout    = 7 * time.Second
+	bodyReadTimeout       = 2 * time.Second
+	responseWriteTimeout  = requestReadTimeout + upstreamTimeout
+	upstreamProbeTimeout  = 500 * time.Millisecond
+	upstreamProbeCacheTTL = 2 * time.Second
+	shutdownGrace         = 5 * time.Second
+	maxCleanupIntervalSec = 30
 )
 
 // serviceName is reported by the / and /health endpoints.
@@ -92,6 +92,11 @@ type rateLimiter struct {
 	windowSec  uint64
 	maxEntries int64
 	entries    atomic.Int64
+	// clockStart carries Go's monotonic clock reading. clockOffset stores the
+	// greatest observed wall-Unix-nanoseconds minus elapsed monotonic nanoseconds;
+	// adding elapsed time to that offset gives a clock that never moves back.
+	clockStart  time.Time
+	clockOffset atomic.Int64
 }
 
 func newRateLimiter(limit, windowSec, maxEntries int) *rateLimiter {
@@ -106,11 +111,52 @@ func newRateLimiter(limit, windowSec, maxEntries int) *rateLimiter {
 	}
 	// Shard maps are allocated lazily. A large MAX_CLIENT_IPS value should not
 	// reserve map buckets for every shard before the first client arrives.
-	return &rateLimiter{
+	started := time.Now()
+	startUnixNano := started.UnixNano()
+	if startUnixNano < 0 {
+		startUnixNano = 0
+	}
+	r := &rateLimiter{
 		limit:      uint32(limit),
 		windowSec:  uint64(windowSec),
 		maxEntries: int64(maxEntries),
+		clockStart: started,
 	}
+	r.clockOffset.Store(startUnixNano)
+	return r
+}
+
+// logicalUnixSeconds combines wall time with the process-local monotonic clock.
+// The offset only moves forward, so a backwards wall-clock correction cannot
+// reset quotas. Unlike a frozen high-water timestamp, elapsed monotonic time
+// continues advancing Retry-After countdowns while the wall clock is behind.
+func (r *rateLimiter) logicalUnixSeconds() uint64 {
+	now := time.Now()
+	return r.logicalUnixSecondsAt(now.UnixNano(), now.Sub(r.clockStart).Nanoseconds())
+}
+
+// logicalUnixSecondsAt updates the forward-only wall/monotonic offset and
+// returns its projection at elapsedNano. Keeping this arithmetic separate
+// makes clock-step behavior deterministic in tests.
+func (r *rateLimiter) logicalUnixSecondsAt(wallUnixNano, elapsedNano int64) uint64 {
+	if wallUnixNano < 0 {
+		wallUnixNano = 0
+	}
+	if elapsedNano < 0 {
+		elapsedNano = 0
+	}
+	candidateOffset := wallUnixNano - elapsedNano
+	for {
+		currentOffset := r.clockOffset.Load()
+		if candidateOffset <= currentOffset || r.clockOffset.CompareAndSwap(currentOffset, candidateOffset) {
+			break
+		}
+	}
+	logicalUnixNano := elapsedNano + r.clockOffset.Load()
+	if logicalUnixNano <= 0 {
+		return 0
+	}
+	return uint64(logicalUnixNano / int64(time.Second))
 }
 
 func addrHash(a netip.Addr) uint64 {
@@ -158,25 +204,15 @@ func (r *rateLimiter) allowWithRetryAfter(ip netip.Addr) (rateLimitResult, uint6
 
 	// Read the clock after acquiring the shard lock so contention across a
 	// window boundary cannot make this decision use an already-expired window.
-	now := time.Now().Unix()
-	if now < 0 {
-		// A pre-epoch wall clock wraps to ~2^64 as uint64, so every request
-		// would land in a fresh window and per-client rate limiting would
-		// silently switch off. Pin to the epoch so behavior degrades to one
-		// long window instead of no limiting.
-		now = 0
-	}
-	nowUnix := uint64(now)
+	nowUnix := r.logicalUnixSeconds()
 	nowWindow := nowUnix / r.windowSec
-	var entry rateEntry
-	var ok bool
-	if sh.m != nil {
-		entry, ok = sh.m[ip]
-	}
+	// Reading a nil map is defined and reports !ok, so an unallocated shard
+	// needs no guard before the lookup.
+	entry, ok := sh.m[ip]
 	if !ok {
-		// The global entry counter is the hard capacity guard. A previous
-		// per-shard-only cap could reject a client merely because its hash
-		// bucket filled early, even when other shards still had capacity.
+		// The global entry counter is the only capacity guard. A per-shard cap
+		// would reject a client whose hash bucket filled early even when other
+		// shards still have room.
 		if !r.reserveEntry() {
 			return rateCapacityReached, 0
 		}
@@ -188,7 +224,9 @@ func (r *rateLimiter) allowWithRetryAfter(ip netip.Addr) (rateLimitResult, uint6
 		entry = rateEntry{window: nowWindow}
 	}
 
-	if entry.window != nowWindow {
+	// Only an older logical window resets the count. The logical clock never
+	// moves backwards; an unexpectedly future entry is retained defensively.
+	if entry.window < nowWindow {
 		entry.window = nowWindow
 		entry.count = 0
 	}
@@ -213,9 +251,9 @@ func (r *rateLimiter) reserveEntry() bool {
 }
 
 // cleanupInterval bounds how long expired entries can occupy limiter slots.
-// Ticking only once per RATE_WINDOW_SECONDS let expired entries linger for up
-// to a whole extra window (a day at the 86,400 maximum), so stale entries could
-// otherwise occupy global client capacity longer than necessary.
+// The sweep runs at most every 30 seconds, so an expired entry is reclaimed
+// within one sweep rather than up to a full window later (a day at the
+// 86,400-second maximum).
 func cleanupInterval(windowSec int) time.Duration {
 	if windowSec > maxCleanupIntervalSec {
 		windowSec = maxCleanupIntervalSec
@@ -224,22 +262,16 @@ func cleanupInterval(windowSec int) time.Duration {
 }
 
 func (r *rateLimiter) cleanup() {
+	// One logical-clock read serves the whole sweep. The high-water mark is
+	// shared with request admission, so a backwards wall-clock step during or
+	// after this sweep cannot make an expired entry current again.
+	nowWindow := r.logicalUnixSeconds() / r.windowSec
 	for i := range r.shards {
 		sh := &r.shards[i]
 		sh.mu.Lock()
-		// Read the current window while holding each shard lock. Capturing it
-		// once before the loop could let a window rollover cause cleanup to
-		// delete newly-created entries from the next window.
-		nowUnix := time.Now().Unix()
-		if nowUnix < 0 {
-			nowUnix = 0
-		}
-		nowWindow := uint64(nowUnix) / r.windowSec
 		for k, v := range sh.m {
-			// Only expired windows may be reclaimed. A window ahead of
-			// nowWindow means the clock moved backwards after the entry was
-			// stored; evicting it would free a slot that the client's next
-			// request immediately re-creates anyway.
+			// Only entries older than the logical current window are expired.
+			// Keep equal or future entries rather than risking premature eviction.
 			if v.window < nowWindow {
 				delete(sh.m, k)
 				r.entries.Add(-1)
@@ -254,9 +286,9 @@ func (r *rateLimiter) cleanup() {
 // but sharing a read-only Config across goroutines is safe and avoids
 // re-allocating one for every 2-second probe.
 var loopbackTLSConfig = &tls.Config{
-	// dnscrypt-proxy's local DoH service uses its bundled localhost
-	// self-signed certificate. It is only ever used for the fixed loopback
-	// upstream, never for public destinations.
+	// dnscrypt-proxy's local DoH service uses the localhost self-signed
+	// certificate generated at image build time. It is only ever used for the
+	// fixed loopback upstream, never for public destinations.
 	InsecureSkipVerify: true, //nolint:gosec // loopback-only fixed upstream
 	MinVersion:         tls.VersionTLS12,
 }
@@ -281,8 +313,8 @@ type server struct {
 	trustProxy   bool
 	// rateDesc is the root endpoint's rate-limit line, formatted once at
 	// startup so GET / does not run fmt.Sprintf on every request.
-	rateDesc     string
-	started      time.Time
+	rateDesc string
+	started  time.Time
 
 	// Cached upstream probe result so health checks do not perform a fresh
 	// TCP+TLS handshake on every call.
@@ -306,7 +338,8 @@ func getenvInt(key string, fallback, lo, hi int) int {
 	// strconv.Atoi accepts a leading "+", but net.Listen does not: a value
 	// like "+8080" passed range validation and then died at bind time with
 	// "listen tcp: lookup +8080: ..." instead of falling back. Reject it so
-	// numeric env vars behave like the health check's port normalization.
+	// numeric env vars fall back the same way everywhere, including the
+	// -healthcheck mode that reads PORT.
 	if strings.HasPrefix(raw, "+") {
 		return fallback
 	}
@@ -407,8 +440,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// errorResponse is the body of every error reply.
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeJSON(w, status, errorResponse{Error: msg})
 }
 
 func isDNSMessageContentType(v string) bool {
@@ -416,19 +454,27 @@ func isDNSMessageContentType(v string) bool {
 	return strings.EqualFold(strings.TrimSpace(mediaType), "application/dns-message")
 }
 
-// drainBoundedBody discards up to limit bytes from an upstream error response
-// so the loopback HTTP connection can be reused. Reading beyond the configured
-// size cap is unnecessary because the response is being rejected anyway; one
-// byte past the cap is enough to prove the body is fully consumed when it is
-// small. All upstream-rejection paths must drain: returning with an unread
-// body forces net/http to close the connection, defeating MaxIdleConns reuse
-// during upstream error bursts.
+// drainBoundedBody consumes a small upstream error response so the loopback
+// HTTP connection can be reused. It reads at most limit+1 bytes: if the body
+// exceeds the cap, the caller closes it and net/http discards that connection
+// rather than allowing an unbounded error-body read.
 func drainBoundedBody(r io.Reader, limit int64) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(r, limit+1))
 }
 
+// drainUpstreamErrorBody avoids spending the full read budget on a response
+// whose Content-Length already proves it cannot be fully drained within the
+// configured cap. Closing that response will discard its connection anyway.
+func drainUpstreamErrorBody(resp *http.Response, limit int64) {
+	if resp.ContentLength > limit {
+		return
+	}
+	drainBoundedBody(resp.Body, limit)
+}
+
 // dnsNameEnd validates a DNS name, including compression pointers, and returns
-// the number of bytes consumed at the containing offset.
+// the offset just past the name as it appears at the containing offset (the
+// position after the first pointer when the name jumps).
 func dnsNameEnd(msg []byte, offset int) (int, bool) {
 	next := offset
 	jumped := false
@@ -678,10 +724,10 @@ func readLimited(r io.Reader, limit, sizeHint int64) (data []byte, tooLarge bool
 // readDNSQuery extracts and validates the DNS wire message from a DoH
 // request, returning the message along with qEnd, the offset just past its
 // question section, so the caller can compare question sections without a
-// second parse. maxEncoded is the base64url-encoded ceiling derived from
-// MAX_DNS_MESSAGE_BYTES; the absolute defaultMaxGetQuerySize ceiling is
-// applied independently. The status return is a non-zero HTTP status code on
-// failure.
+// second parse. maxEncoded must be base64.RawURLEncoding.EncodedLen(maxBody):
+// that is what bounds the decoded size of a GET query. The absolute
+// defaultMaxGetQuerySize ceiling is applied independently. The status return
+// is a non-zero HTTP status code on failure.
 func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, int) {
 	var msg []byte
 	if r.Method == http.MethodPost {
@@ -726,12 +772,12 @@ func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, 
 		if strings.ContainsAny(encoded, "\r\n") {
 			return nil, 0, http.StatusBadRequest
 		}
+		// len(encoded) <= maxEncoded (= EncodedLen(maxBody)) already bounds the
+		// decoded length by maxBody, since raw base64url decodes to at most n*6/8
+		// bytes, so no separate decoded-size check is needed here.
 		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
 		if err != nil {
 			return nil, 0, http.StatusBadRequest
-		}
-		if int64(len(decoded)) > maxBody {
-			return nil, 0, http.StatusRequestEntityTooLarge
 		}
 		msg = decoded
 	}
@@ -812,6 +858,21 @@ func allowGetOrHead(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+// healthResponse and rootResponse have fixed fields, so typed structs replace
+// the per-request maps. Declaration order is the JSON key order and is kept
+// alphabetical.
+type healthResponse struct {
+	Service string `json:"service"`
+	Status  string `json:"status"`
+	Uptime  string `json:"uptime"`
+}
+
+type rootResponse struct {
+	Endpoint  string `json:"endpoint"`
+	RateLimit string `json:"rateLimit"`
+	Service   string `json:"service"`
+}
+
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if !allowGetOrHead(w, r) {
 		return
@@ -820,27 +881,22 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if !s.upstreamReady() {
 		status, state = http.StatusServiceUnavailable, "starting"
 	}
-	// Pre-size the response map: the orchestrator polls /health on a fixed
-	// interval, and a literal map would grow through reallocations on every
-	// single call.
-	body := make(map[string]any, 3)
-	body["status"] = state
-	body["service"] = serviceName
-	body["uptime"] = time.Since(s.started).Round(time.Second).String()
-	writeJSON(w, status, body)
+	writeJSON(w, status, healthResponse{
+		Service: serviceName,
+		Status:  state,
+		Uptime:  time.Since(s.started).Round(time.Second).String(),
+	})
 }
 
 func (s *server) root(w http.ResponseWriter, r *http.Request) {
 	if !allowGetOrHead(w, r) {
 		return
 	}
-	// Pre-size the map like in health: these keys are fixed, so the capacity
-	// hint avoids the literal-map growth reallocations on every request.
-	body := make(map[string]any, 3)
-	body["service"] = serviceName
-	body["endpoint"] = s.dohPath
-	body["rateLimit"] = s.rateDesc
-	writeJSON(w, http.StatusOK, body)
+	writeJSON(w, http.StatusOK, rootResponse{
+		Endpoint:  s.dohPath,
+		RateLimit: s.rateDesc,
+		Service:   serviceName,
+	})
 }
 
 // unavailableRetryAfter1 answers 503 with a one-second Retry-After hint. The
@@ -851,10 +907,9 @@ func unavailableRetryAfter1(w http.ResponseWriter, msg string) {
 	writeError(w, http.StatusServiceUnavailable, msg)
 }
 
-// doh handles requests for the configured DoH path only; the root mux wrapper
-// dispatches matching paths here, and validateDoHPath keeps the reserved
-// /health and / paths free, so no additional path check is needed inside the
-// handler.
+// doh handles requests for the configured DoH path only. ServeHTTP dispatches
+// matching paths here, and validateDoHPath keeps the reserved /health and /
+// paths free, so no additional path check is needed inside the handler.
 func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
@@ -946,21 +1001,20 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// net/http consumes interim 1xx responses, so the final status here is
-	// always >= 200; the old < 200 arm was unreachable. RFC 8484 mandates
-	// exactly 200 for a successful DoH response, so reject anything else.
+	// net/http consumes interim 1xx responses, so the final status is always
+	// >= 200. RFC 8484 mandates exactly 200 for a successful DoH response, so
+	// reject anything else.
 	if resp.StatusCode != http.StatusOK {
-		drainBoundedBody(resp.Body, s.maxBody)
+		drainUpstreamErrorBody(resp, s.maxBody)
 		writeError(w, http.StatusBadGateway, "dns upstream returned an invalid HTTP status")
 		return
 	}
 	if !isDNSMessageContentType(resp.Header.Get("Content-Type")) {
-		drainBoundedBody(resp.Body, s.maxBody)
+		drainUpstreamErrorBody(resp, s.maxBody)
 		writeError(w, http.StatusBadGateway, "dns upstream returned an invalid content type")
 		return
 	}
 	if resp.ContentLength > s.maxBody {
-		drainBoundedBody(resp.Body, s.maxBody)
 		writeError(w, http.StatusBadGateway, "dns upstream response exceeds configured size limit")
 		return
 	}
@@ -1037,15 +1091,38 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// healthcheckURL returns the loopback /health address for the configured PORT.
+// The container health check runs the gateway binary, so it uses getenvInt's
+// validation and fallback rather than a shell re-implementation that can drift.
+func healthcheckURL() string {
+	return "http://127.0.0.1:" + strconv.Itoa(getenvInt("PORT", defaultPort, 1, 65535)) + "/health"
+}
+
+// runHealthcheck returns 0 when target answers 200 OK and 1 otherwise.
+func runHealthcheck(target string) int {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(target)
+	if err != nil {
+		return 1
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
+}
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		os.Exit(runHealthcheck(healthcheckURL()))
+	}
 	port := strconv.Itoa(getenvInt("PORT", defaultPort, 1, 65535))
 	dohPath := getenv("DOH_PATH", defaultDoHPath)
 	rateLimit := getenvInt("RATE_LIMIT", defaultRateLimit, 1, maxRateLimit)
 	rateWindow := getenvInt("RATE_WINDOW_SECONDS", defaultRateWindowSec, 1, maxRateWindowSec)
 	maxBody := getenvInt("MAX_DNS_MESSAGE_BYTES", defaultMaxBodyBytes, minMaxBodyBytes, maxMaxBodyBytes)
-	// concLimit, not maxConcurrency: the package-level const maxConcurrency is
-	// the env-var validation bound; shadowing it with the parsed local value
-	// was legal but made the two meanings easy to confuse.
+	// concLimit, not maxConcurrency: the latter is the env-var validation bound.
 	concLimit := getenvInt("MAX_CONCURRENCY", defaultConcurrency, 1, maxConcurrency)
 	maxClients := getenvInt("MAX_CLIENT_IPS", defaultClientEntries, shardCount, maxClientEntries)
 	trustProxy := getenvBool("TRUST_PROXY_HEADERS", false)
