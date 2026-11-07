@@ -9,6 +9,10 @@ Dockerfile. Only the latest changes are listed.
 
 ### Fixed
 
+- Docker health check: `-healthcheck` connects directly without an
+  environment-configured proxy, rejects redirects, and validates the bounded
+  JSON service identity and `status: "ok"` instead of trusting any local HTTP
+  200 response.
 - Rate limiter: request admission and cleanup now share a non-decreasing logical
   clock projected from wall time and monotonic elapsed time. A backwards
   wall-clock correction, including one during a cleanup sweep, can no longer

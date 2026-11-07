@@ -42,26 +42,27 @@ const (
 	// GET query is rejected with 414 before parsing. "&" is the only separator
 	// tolerated here: url.ParseQuery rejects query settings containing ";",
 	// so a semicolon must not let an oversized query bypass the fast-fail.
-	maxGetQueryFastFail   = defaultMaxGetQuerySize + len("dns=")
-	minMaxBodyBytes       = 512
-	maxMaxBodyBytes       = 65535
-	maxRateLimit          = 1000000
-	maxRateWindowSec      = 86400
-	maxConcurrency        = 16
-	maxClientEntries      = 32768
-	maxDNSNameBytes       = 255
-	maxDNSRecords         = 4096
-	dnsTypeOPT            = 41
-	dnsOpcodeMask         = 0x7800
-	shardCount            = 64
-	upstreamTimeout       = 6 * time.Second
-	requestReadTimeout    = 7 * time.Second
-	bodyReadTimeout       = 2 * time.Second
-	responseWriteTimeout  = requestReadTimeout + upstreamTimeout
-	upstreamProbeTimeout  = 500 * time.Millisecond
-	upstreamProbeCacheTTL = 2 * time.Second
-	shutdownGrace         = 5 * time.Second
-	maxCleanupIntervalSec = 30
+	maxGetQueryFastFail     = defaultMaxGetQuerySize + len("dns=")
+	minMaxBodyBytes         = 512
+	maxMaxBodyBytes         = 65535
+	maxRateLimit            = 1000000
+	maxRateWindowSec        = 86400
+	maxConcurrency          = 16
+	maxClientEntries        = 32768
+	maxDNSNameBytes         = 255
+	maxDNSRecords           = 4096
+	dnsTypeOPT              = 41
+	dnsOpcodeMask           = 0x7800
+	shardCount              = 64
+	upstreamTimeout         = 6 * time.Second
+	requestReadTimeout      = 7 * time.Second
+	bodyReadTimeout         = 2 * time.Second
+	responseWriteTimeout    = requestReadTimeout + upstreamTimeout
+	upstreamProbeTimeout    = 500 * time.Millisecond
+	upstreamProbeCacheTTL   = 2 * time.Second
+	maxHealthcheckBodyBytes = 4096
+	shutdownGrace           = 5 * time.Second
+	maxCleanupIntervalSec   = 30
 )
 
 // serviceName is reported by the / and /health endpoints.
@@ -1098,16 +1099,37 @@ func healthcheckURL() string {
 	return "http://127.0.0.1:" + strconv.Itoa(getenvInt("PORT", defaultPort, 1, 65535)) + "/health"
 }
 
-// runHealthcheck returns 0 when target answers 200 OK and 1 otherwise.
+// runHealthcheck returns 0 only when target reports this gateway as healthy.
+// The bounded JSON check prevents an unrelated local listener returning HTTP
+// 200 from making the container appear healthy.
 func runHealthcheck(target string) int {
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{
+		// This probe is only for the gateway's local listener. Do not route it
+		// through an environment-configured proxy or follow a redirect to some
+		// other service that could produce a false-positive health result.
+		Transport: &http.Transport{Proxy: nil},
+		Timeout:   2 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Get(target)
 	if err != nil {
 		return 1
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK || resp.ContentLength > maxHealthcheckBodyBytes {
+		return 1
+	}
+	body, tooLarge, err := readLimited(resp.Body, maxHealthcheckBodyBytes, resp.ContentLength)
+	if err != nil || tooLarge {
+		return 1
+	}
+	var health healthResponse
+	if err := json.Unmarshal(body, &health); err != nil {
+		return 1
+	}
+	if health.Service != serviceName || health.Status != "ok" {
 		return 1
 	}
 	return 0

@@ -456,9 +456,33 @@ func TestHealthcheckURLUsesGatewayPortFallback(t *testing.T) {
 	}
 }
 
+func TestRunHealthcheckDoesNotFollowRedirects(t *testing.T) {
+	targetHits := make(chan struct{}, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer origin.Close()
+
+	if got := runHealthcheck(origin.URL); got != 1 {
+		t.Fatalf("redirect response: runHealthcheck = %d, want 1", got)
+	}
+	select {
+	case <-targetHits:
+		t.Fatal("health check followed a redirect to another service")
+	default:
+	}
+}
+
 func TestRunHealthcheckExitCodes(t *testing.T) {
 	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = io.WriteString(w, `{"service":"minimal-hagezi-doh","status":"ok","uptime":"1s"}`)
 	}))
 	defer ok.Close()
 	if got := runHealthcheck(ok.URL + "/health"); got != 0 {
@@ -475,6 +499,42 @@ func TestRunHealthcheckExitCodes(t *testing.T) {
 
 	if got := runHealthcheck("http://127.0.0.1:1/health"); got != 1 {
 		t.Fatalf("refused connection: runHealthcheck = %d, want 1", got)
+	}
+}
+
+func TestRunHealthcheckRejectsUnrelatedOrInvalid200Responses(t *testing.T) {
+	for name, body := range map[string]string{
+		"plain text":       "ok",
+		"wrong service":    `{"service":"other-service","status":"ok","uptime":"1s"}`,
+		"starting service": `{"service":"minimal-hagezi-doh","status":"starting","uptime":"1s"}`,
+		"malformed JSON":   `{"service":"minimal-hagezi-doh","status":"ok"`,
+		"trailing JSON":    `{"service":"minimal-hagezi-doh","status":"ok","uptime":"1s"}{}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, body)
+			}))
+			defer server.Close()
+			if got := runHealthcheck(server.URL); got != 1 {
+				t.Fatalf("runHealthcheck = %d, want 1 for %s", got, name)
+			}
+		})
+	}
+}
+
+func TestRunHealthcheckRejectsOversized200Response(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // force an unknown-length, chunked response
+		}
+		_, _ = io.WriteString(w, `{"service":"minimal-hagezi-doh","status":"ok","uptime":"1s"}`+strings.Repeat(" ", maxHealthcheckBodyBytes))
+	}))
+	defer server.Close()
+	if got := runHealthcheck(server.URL); got != 1 {
+		t.Fatalf("oversized response: runHealthcheck = %d, want 1", got)
 	}
 }
 
