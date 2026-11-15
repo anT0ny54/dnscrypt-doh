@@ -11,7 +11,11 @@ dns_pid=
 gateway_pid=
 
 cleanup() {
-  trap - TERM INT HUP EXIT
+  # Ignore further stop signals while draining. Restoring default handling here
+  # let a repeated TERM kill this shell mid-drain, which skipped the gateway's
+  # graceful shutdown and left dnscrypt-proxy running as an orphan.
+  trap '' TERM INT HUP
+  trap - EXIT
   if [ -n "$gateway_pid" ]; then
     kill "$gateway_pid" 2>/dev/null || true
     wait "$gateway_pid" 2>/dev/null || true
@@ -35,6 +39,11 @@ trap cleanup EXIT
 # BusyBox ash's wait -n, which can miss an older child that exited before the
 # wait began while a newer child keeps running.
 child_running() {
+  # An empty PID would expand to /proc//stat, which resolves to /proc/stat and
+  # reads as a live process. Reject anything that is not a numeric PID.
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
   [ -r "/proc/$1/stat" ] || return 1
   process_stat=
   read -r process_stat < "/proc/$1/stat" || return 1

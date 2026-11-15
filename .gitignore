@@ -1,5 +1,7 @@
-# Local environment overrides (never commit real .env files)
-.env
+# Local environment overrides and variants (keep the committed template).
+.env*
+*.env*
+!/.env.example
 
 # Release / upload artifacts
 *.zip

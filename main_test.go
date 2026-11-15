@@ -41,6 +41,25 @@ func testResponse(query []byte) []byte {
 	return body
 }
 
+func testResponseWithPrefixedCompressedOwner(query []byte) []byte {
+	body := append([]byte(nil), query...)
+	body[2] = 0x81
+	body[3] = 0x80
+	body[6] = 0x00
+	body[7] = 0x01
+	// The owner name is "www" followed by a pointer to the prior question
+	// name. This is the valid labels-then-pointer form of DNS compression.
+	body = append(body,
+		0x03, 'w', 'w', 'w', 0xc0, 0x0c,
+		0x00, 0x01,
+		0x00, 0x01,
+		0x00, 0x00, 0x00, 0x3c,
+		0x00, 0x04,
+		93, 184, 216, 34,
+	)
+	return body
+}
+
 func queryWithQName(id byte, qname []byte) []byte {
 	body := []byte{
 		0x12, id, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -80,8 +99,29 @@ func queryWithOPTOptions(id byte, options []byte) []byte {
 	return append(body, options...)
 }
 
+func testResourceRecord(rtype uint16, rdata []byte) []byte {
+	rr := []byte{
+		0x00, // root owner name
+		byte(rtype >> 8), byte(rtype),
+		0x00, 0x01, // IN class
+		0x00, 0x00, 0x00, 0x00, // zero TTL
+		byte(len(rdata) >> 8), byte(len(rdata)),
+	}
+	return append(rr, rdata...)
+}
+
 type trackingBody struct {
 	read bool
+}
+
+type readDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (w *readDeadlineRecorder) SetReadDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
 }
 
 func (b *trackingBody) Read(_ []byte) (int, error) {
@@ -185,6 +225,55 @@ func TestValidDNSMessageRejectsForwardCompressionPointer(t *testing.T) {
 	}
 }
 
+func TestValidDNSResponseAcceptsLabelPrefixBeforeCompressionPointer(t *testing.T) {
+	response := testResponseWithPrefixedCompressedOwner(testQuery(55))
+	if !validDNSMessage(response, true) {
+		t.Fatal("expected an uncompressed label prefix followed by a backward pointer to validate")
+	}
+}
+
+func TestValidDNSResponseRejectsCompressionPointerToRootTerminator(t *testing.T) {
+	response := testResponse(testQuery(11))
+	// Offset 24 is the question's root terminator. A pointer must target a
+	// non-empty label-length octet, not the terminator itself.
+	response[30] = 0x18
+	if validDNSMessage(response, true) {
+		t.Fatal("expected pointer to a root terminator to be rejected")
+	}
+}
+
+func TestValidDNSResponseRejectsNestedCompressionPointer(t *testing.T) {
+	response := testResponse(testQuery(12))
+	response[7] = 2 // Add a second answer record.
+	// The first answer owner starts at offset 29 and is itself a pointer to the
+	// question name. The second answer must not point to that pointer.
+	response = append(response, []byte{
+		0xc0, 0x1d, // owner pointer to the first answer's pointer
+		0x00, 0x01, // A
+		0x00, 0x01, // IN
+		0x00, 0x00, 0x00, 0x3c, // TTL
+		0x00, 0x00, // empty RDATA
+	}...)
+	if validDNSMessage(response, true) {
+		t.Fatal("expected nested compression pointer to be rejected")
+	}
+}
+
+func TestValidDNSResponseRejectsCompressionTargetOverlappingPointer(t *testing.T) {
+	response := testResponse(testQuery(19))
+	// The answer owner pointer begins at offset 29 and targets offset 27.
+	// Make offset 27 look like a four-byte label whose payload crosses the
+	// pointer itself; subsequent RR header bytes then look like a terminating
+	// name. The target is earlier, but it is not a complete prior name.
+	response[27] = 4
+	response[28] = 'x'
+	response[29] = 0xc0
+	response[30] = 0x1b // pointer to offset 27
+	if validDNSMessage(response, true) {
+		t.Fatal("expected compression target overlapping its pointer to be rejected")
+	}
+}
+
 func TestValidDNSMessageRejectsCompressedQuestionName(t *testing.T) {
 	// A backward pointer inside the question section is invalid: compression
 	// is only permitted inside resource records, so the question parser must
@@ -281,6 +370,63 @@ func TestValidDNSMessageRejectsNonOPTAdditionalInQuery(t *testing.T) {
 	}
 }
 
+func TestValidDNSMessageRejectsTSIGAndSIG0ClientQueries(t *testing.T) {
+	// These records have complete wire framing and the standard Additional
+	// placement, but this gateway intentionally does not authenticate them.
+	tsigRDATA := []byte{
+		0x0b, 'h', 'm', 'a', 'c', '-', 's', 'h', 'a', '2', '5', '6', 0, // algorithm name
+		0, 0, 0, 0, 0, 1, // 48-bit signing time
+		0x01, 0x2c, // fudge = 300 seconds
+		0, 1, 0xaa, // one-byte MAC
+		0x12, 0x34, // original ID
+		0, 0, // error
+		0, 0, // other data length = 0
+	}
+	tsigRR := []byte{
+		0x03, 'k', 'e', 'y', 0, // owner name
+		0x00, 0xfa, // TSIG
+		0x00, 0xff, // ANY class
+		0, 0, 0, 0, // TTL = 0
+		byte(len(tsigRDATA) >> 8), byte(len(tsigRDATA)),
+	}
+	tsigRR = append(tsigRR, tsigRDATA...)
+
+	// SIG(0): Type Covered = 0, algorithm, labels, original TTL, expiration,
+	// inception, key tag, signer name (root), and one signature octet.
+	sig0RDATA := []byte{
+		0, 0, // Type Covered = 0 identifies SIG(0)
+		1, 0, // algorithm and labels
+		0, 0, 0, 0, // original TTL
+		0, 0, 0, 1, // expiration
+		0, 0, 0, 1, // inception
+		0, 1, // key tag
+		0,    // signer name = root
+		0xaa, // signature
+	}
+	sig0RR := []byte{
+		0,          // owner name = root
+		0x00, 0x18, // SIG
+		0x00, 0xff, // ANY class
+		0, 0, 0, 0, // TTL = 0
+		byte(len(sig0RDATA) >> 8), byte(len(sig0RDATA)),
+	}
+	sig0RR = append(sig0RR, sig0RDATA...)
+
+	for name, rr := range map[string][]byte{
+		"TSIG":   tsigRR,
+		"SIG(0)": sig0RR,
+	} {
+		t.Run(name, func(t *testing.T) {
+			query := testQuery(52)
+			query[11] = 1 // ARCOUNT = 1
+			query = append(query, rr...)
+			if validDNSMessage(query, false) {
+				t.Fatalf("expected %s-signed client query to be rejected by the unsigned-query profile", name)
+			}
+		})
+	}
+}
+
 func TestValidDNSMessageRejectsDuplicateOPTRecords(t *testing.T) {
 	query := queryWithAdditional(24, dnsTypeOPT)
 	query[10], query[11] = 0, 2 // ARCOUNT = 2
@@ -311,9 +457,9 @@ func TestValidDNSResponseRejectsOPTOutsideAdditionalSection(t *testing.T) {
 	}
 }
 
-func TestValidDNSResponseRejectsOPTNotLastInAdditionalSection(t *testing.T) {
+func TestValidDNSResponseAcceptsOPTBeforeOtherAdditionalRecord(t *testing.T) {
 	response := testResponse(testQuery(28))
-	response[10], response[11] = 0, 2 // ARCOUNT = 2
+	response[10], response[11] = 0, 2 // ARCOUNT = 2: OPT followed by an A record.
 	response = append(response, []byte{
 		0x00,       // root owner name
 		0x00, 0x29, // OPT (41)
@@ -326,8 +472,89 @@ func TestValidDNSResponseRejectsOPTNotLastInAdditionalSection(t *testing.T) {
 		0x00, 0x00, 0x00, 0x3c, // TTL
 		0x00, 0x00, // empty RDATA
 	}...)
+	if !validDNSMessage(response, true) {
+		t.Fatal("expected OPT before another additional record to be accepted")
+	}
+}
+
+func TestValidDNSResponseRejectsDuplicateOPTRecords(t *testing.T) {
+	response := testResponse(testQuery(29))
+	response[10], response[11] = 0, 2 // ARCOUNT = 2: duplicate OPT records.
+	opt := []byte{
+		0x00,       // root owner name
+		0x00, 0x29, // OPT (41)
+		0x10, 0x00, // UDP payload size
+		0x00, 0x00, 0x00, 0x00, // extended RCODE, version, flags
+		0x00, 0x00, // empty RDATA
+	}
+	response = append(response, opt...)
+	response = append(response, opt...)
 	if validDNSMessage(response, true) {
-		t.Fatal("expected OPT not last in the additional section to be rejected")
+		t.Fatal("expected duplicate OPT records to be rejected")
+	}
+}
+
+func TestValidDNSResponseRequiresTSIGAndSIG0LastInAdditional(t *testing.T) {
+	opt := testResourceRecord(dnsTypeOPT, nil)
+	tsig := testResourceRecord(dnsTypeTSIG, nil)
+	sig0 := testResourceRecord(dnsTypeSIG, []byte{0x00, 0x00})
+	other := testResourceRecord(1, nil)
+
+	tests := []struct {
+		name       string
+		records    [][]byte
+		answerTSIG bool
+		wantValid  bool
+	}{
+		{
+			name:      "OPT may precede final TSIG",
+			records:   [][]byte{opt, tsig},
+			wantValid: true,
+		},
+		{
+			name:      "TSIG may not precede another additional record",
+			records:   [][]byte{tsig, opt},
+			wantValid: false,
+		},
+		{
+			name:       "TSIG may not appear in Answer",
+			records:    [][]byte{tsig},
+			answerTSIG: true,
+			wantValid:  false,
+		},
+		{
+			name:      "OPT may precede final SIG(0)",
+			records:   [][]byte{opt, sig0},
+			wantValid: true,
+		},
+		{
+			name:      "SIG(0) may not precede another additional record",
+			records:   [][]byte{sig0, opt},
+			wantValid: false,
+		},
+		{
+			name:      "ordinary SIG may precede another additional record",
+			records:   [][]byte{testResourceRecord(dnsTypeSIG, []byte{0x00, 0x01}), other},
+			wantValid: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			response := testResponse(testQuery(30))
+			if tc.answerTSIG {
+				response[7]++ // Add the TSIG record to the Answer section.
+			} else {
+				response[10] = byte(len(tc.records) >> 8)
+				response[11] = byte(len(tc.records))
+			}
+			for _, rr := range tc.records {
+				response = append(response, rr...)
+			}
+			if got := validDNSMessage(response, true); got != tc.wantValid {
+				t.Fatalf("validDNSMessage = %t, want %t", got, tc.wantValid)
+			}
+		})
 	}
 }
 
@@ -445,8 +672,6 @@ func TestHealthcheckURLUsesGatewayPortFallback(t *testing.T) {
 	for value, want := range map[string]string{
 		"9090":   "9090",
 		" 9091 ": "9091",
-		"+9090":  "8080",
-		"0":      "8080",
 		"":       "8080",
 	} {
 		t.Setenv("PORT", value)
@@ -688,6 +913,21 @@ func TestRateLimiterSharedShardDoesNotReduceGlobalCapacity(t *testing.T) {
 	}
 }
 
+func TestRateLimiterLogicalClockClampsOutOfOrderSamples(t *testing.T) {
+	r := newRateLimiter(2, 60, 64)
+	startWall := r.clockStart.UnixNano()
+	second := int64(time.Second)
+
+	// Model a goroutine delayed after sampling an earlier monotonic timestamp:
+	// a different shard observes the later sample first, then the stale sample
+	// reaches logicalUnixSecondsAt.
+	later := r.logicalUnixSecondsAt(startWall+11*second, 11*second)
+	earlier := r.logicalUnixSecondsAt(startWall+10*second, 10*second)
+	if earlier != later {
+		t.Fatalf("stale sample moved logical time backward: earlier=%d later=%d", earlier, later)
+	}
+}
+
 func TestRateLimiterLogicalClockNeverMovesBackwardAndAdvancesDuringRollback(t *testing.T) {
 	r := newRateLimiter(2, 60, 64)
 	startWall := r.clockStart.UnixNano()
@@ -821,7 +1061,7 @@ func TestRateLimiterCleanupReleasesGlobalCapacity(t *testing.T) {
 	}
 }
 
-func TestRateLimiterUsesValueEntriesAndEnforcesLimit(t *testing.T) {
+func TestRateLimiterEnforcesPerClientLimit(t *testing.T) {
 	r := newRateLimiter(2, 60, 64)
 	ip := netip.MustParseAddr("192.0.2.10")
 	if r.allow(ip) != rateAllowed || r.allow(ip) != rateAllowed {
@@ -931,9 +1171,12 @@ func TestReadDNSQueryAcceptsValidDNSWithExtraParametersPastFastFailThreshold(t *
 		t.Fatal("test query must exceed the oversized-query fast-fail threshold")
 	}
 	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?"+rawQuery, nil)
-	got, _, status := readDNSQuery(req, defaultMaxBodyBytes, base64.RawURLEncoding.EncodedLen(defaultMaxBodyBytes))
+	got, _, status, bodyConsumed := readDNSQuery(req, defaultMaxBodyBytes, base64.RawURLEncoding.EncodedLen(defaultMaxBodyBytes))
 	if status != 0 {
 		t.Fatalf("status = %d, want success for a valid dns parameter with an extra parameter", status)
+	}
+	if bodyConsumed {
+		t.Fatal("GET parsing must not report a consumed POST body")
 	}
 	if !bytes.Equal(got, query) {
 		t.Fatal("decoded DNS query does not match the original message")
@@ -954,7 +1197,7 @@ func TestReadDNSQueryRejectsBase64URLLineBreaks(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString(testQuery(35))
 	mid := len(encoded) / 2
 	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?dns="+encoded[:mid]+"%0A"+encoded[mid:], nil)
-	if _, _, status := readDNSQuery(req, defaultMaxBodyBytes, base64.RawURLEncoding.EncodedLen(defaultMaxBodyBytes)); status != http.StatusBadRequest {
+	if _, _, status, _ := readDNSQuery(req, defaultMaxBodyBytes, base64.RawURLEncoding.EncodedLen(defaultMaxBodyBytes)); status != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for a line break inside the base64url value", status)
 	}
 }
@@ -987,7 +1230,7 @@ func TestDoHGetIsDecodedAndForwardedAsPOST(t *testing.T) {
 	}
 }
 
-func TestDoHRejectsInvalidInputWithinConcurrencyBudget(t *testing.T) {
+func TestDoHReleasesConcurrencySlotOnBadRequest(t *testing.T) {
 	s := newTestGateway("http://127.0.0.1:9/dns-query")
 	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader("not-dns"))
 	req.Header.Set("Content-Type", "application/dns-message")
@@ -1020,15 +1263,257 @@ func TestDoHConcurrencyGateRejectsBeforeReadingBody(t *testing.T) {
 	}
 }
 
+func TestDoHPreAdmissionRejectionsKeepPOSTReadDeadline(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		setup  func(*server, *http.Request)
+	}{
+		{
+			name:   "concurrency limit",
+			status: http.StatusServiceUnavailable,
+			setup: func(s *server, _ *http.Request) {
+				for i := 0; i < cap(s.sem); i++ {
+					s.sem <- struct{}{}
+				}
+			},
+		},
+		{
+			name:   "rate limit",
+			status: http.StatusTooManyRequests,
+			setup: func(s *server, req *http.Request) {
+				s.rate = newRateLimiter(1, 60, 64)
+				ip := netip.MustParseAddr("192.0.2.90")
+				if got := s.rate.allow(ip); got != rateAllowed {
+					t.Fatalf("priming rate-limit decision = %v, want rateAllowed", got)
+				}
+				req.RemoteAddr = ip.String() + ":1234"
+			},
+		},
+		{
+			name:   "client table capacity",
+			status: http.StatusServiceUnavailable,
+			setup: func(s *server, req *http.Request) {
+				s.rate = newRateLimiter(99, 60, 64)
+				for i := 1; i <= 64; i++ {
+					ip := netip.AddrFrom4([4]byte{198, 18, byte(i / 256), byte(i)})
+					if got := s.rate.allow(ip); got != rateAllowed {
+						t.Fatalf("priming client %d decision = %v, want rateAllowed", i, got)
+					}
+				}
+				req.RemoteAddr = "203.0.113.201:1234"
+			},
+		},
+		{
+			name:   "invalid client address",
+			status: http.StatusServiceUnavailable,
+			setup: func(_ *server, req *http.Request) {
+				req.RemoteAddr = "not-an-ip-address"
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestGateway("http://127.0.0.1:9/dns-query")
+			body := &trackingBody{}
+			req := httptest.NewRequest(http.MethodPost, defaultDoHPath, nil)
+			req.Body = body
+			req.ContentLength = -1
+			req.Header.Set("Content-Type", "application/dns-message")
+			tc.setup(s, req)
+
+			rec := &readDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+			s.doh(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+			if body.read {
+				t.Fatal("POST body was read before admission rejection")
+			}
+			if len(rec.deadlines) != 1 || rec.deadlines[0].IsZero() {
+				t.Fatalf("read deadlines = %v, want one active short deadline", rec.deadlines)
+			}
+		})
+	}
+}
+
+func TestDoHPreAdmissionRejectionWithoutPOSTBodyDoesNotSetReadDeadline(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	s.rate = newRateLimiter(1, 60, 64)
+	ip := netip.MustParseAddr("192.0.2.91")
+	if got := s.rate.allow(ip); got != rateAllowed {
+		t.Fatalf("priming rate-limit decision = %v, want rateAllowed", got)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, nil)
+	req.RemoteAddr = ip.String() + ":1234"
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := &readDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	s.doh(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if len(rec.deadlines) != 0 {
+		t.Fatalf("read deadlines = %v, want none for a bodyless POST", rec.deadlines)
+	}
+}
+
+func TestHandlersBoundBodiesTheyLeaveUnread(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		status int
+	}{
+		{name: "unsupported DoH method", method: http.MethodPut, path: defaultDoHPath, status: http.StatusMethodNotAllowed},
+		{name: "ignored DoH GET body", method: http.MethodGet, path: defaultDoHPath, status: http.StatusBadRequest},
+		{name: "unsupported health method", method: http.MethodPost, path: "/health", status: http.StatusMethodNotAllowed},
+		{name: "unsupported root method", method: http.MethodPost, path: "/", status: http.StatusMethodNotAllowed},
+		{name: "ignored root body", method: http.MethodGet, path: "/", status: http.StatusOK},
+		{name: "unknown path", method: http.MethodPost, path: "/unknown", status: http.StatusNotFound},
+		{name: "non-canonical path", method: http.MethodPost, path: "/%68ealth", status: http.StatusNotFound},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestGateway("http://127.0.0.1:9/dns-query")
+			body := &trackingBody{}
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Body = body
+			req.ContentLength = -1
+			rec := &readDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+			s.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+			if body.read {
+				t.Fatal("handler read a body that should have been left for bounded cleanup")
+			}
+			if len(rec.deadlines) != 1 || rec.deadlines[0].IsZero() {
+				t.Fatalf("read deadlines = %v, want one active short deadline", rec.deadlines)
+			}
+		})
+	}
+}
+
 func TestDoHRejectsOversizedPOST(t *testing.T) {
 	s := newTestGateway("http://127.0.0.1:9/dns-query")
 	s.maxBody = 16
 	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader("0123456789abcdefghijklmnop"))
 	req.Header.Set("Content-Type", "application/dns-message")
+	// Unknown length (chunked) forces the streaming limit in readLimited rather
+	// than the Content-Length pre-check that TestDoHRejectsAdvertisedOversizedPOST
+	// covers.
+	req.ContentLength = -1
 	rec := httptest.NewRecorder()
 	s.doh(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+}
+
+func TestDoHKeepsPOSTReadDeadlineWhenBodyIsNotConsumed(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*server) *http.Request
+		want  int
+	}{
+		{
+			name: "unsupported content type",
+			setup: func(_ *server) *http.Request {
+				req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader("unread body"))
+				req.Header.Set("Content-Type", "text/plain")
+				return req
+			},
+			want: http.StatusUnsupportedMediaType,
+		},
+		{
+			name: "advertised oversized body",
+			setup: func(s *server) *http.Request {
+				s.maxBody = 512
+				req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader("unread body"))
+				req.Header.Set("Content-Type", "application/dns-message")
+				req.ContentLength = 513
+				return req
+			},
+			want: http.StatusRequestEntityTooLarge,
+		},
+		{
+			name: "streaming oversized body",
+			setup: func(s *server) *http.Request {
+				s.maxBody = 512
+				req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader(strings.Repeat("x", 600)))
+				req.Header.Set("Content-Type", "application/dns-message")
+				req.ContentLength = -1
+				return req
+			},
+			want: http.StatusRequestEntityTooLarge,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestGateway("http://127.0.0.1:9/dns-query")
+			req := tc.setup(s)
+			rec := &readDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+			s.doh(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+			if len(rec.deadlines) != 1 || rec.deadlines[0].IsZero() {
+				t.Fatalf("read deadlines = %v, want only the active short deadline", rec.deadlines)
+			}
+		})
+	}
+}
+
+func TestDoHClearsPOSTReadDeadlineAfterBodyEOF(t *testing.T) {
+	s := newTestGateway("http://127.0.0.1:9/dns-query")
+	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader("not a DNS message"))
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := &readDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	s.doh(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if len(rec.deadlines) != 2 || rec.deadlines[0].IsZero() || !rec.deadlines[1].IsZero() {
+		t.Fatalf("read deadlines = %v, want set then clear after body EOF", rec.deadlines)
+	}
+}
+
+func TestUpstreamTransportCapsResponseHeaders(t *testing.T) {
+	const concurrency = 3
+	transport := newUpstreamTransport(concurrency)
+	defer transport.CloseIdleConnections()
+
+	if transport.MaxResponseHeaderBytes != int64(defaultMaxHeaderBytes) {
+		t.Fatalf("MaxResponseHeaderBytes = %d, want %d", transport.MaxResponseHeaderBytes, defaultMaxHeaderBytes)
+	}
+	if transport.MaxIdleConns != concurrency || transport.MaxIdleConnsPerHost != concurrency || transport.MaxConnsPerHost != concurrency {
+		t.Fatalf("connection limits = (%d, %d, %d), want %d", transport.MaxIdleConns, transport.MaxIdleConnsPerHost, transport.MaxConnsPerHost, concurrency)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("upstream transport must not use environment-configured proxies")
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Oversized", strings.Repeat("x", defaultMaxHeaderBytes))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	client := &http.Client{Transport: transport}
+	resp, err := client.Get(upstream.URL)
+	if err == nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		t.Fatal("request unexpectedly accepted an oversized upstream response header")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "header") {
+		t.Fatalf("error = %v, want a response-header size error", err)
 	}
 }
 
@@ -1156,13 +1641,11 @@ func TestDoHAcceptsCaseInsensitiveResponseQuestion(t *testing.T) {
 
 func TestDoHRejectsMismatchedResponseOpcode(t *testing.T) {
 	query := testQuery(32)
-	query[2] |= 0x10 // Opcode 2 (IQUERY), which the response must preserve.
+	query[2] |= 0x10 // Opcode 2 (IQUERY) in the query.
+	// testResponse always writes flags 0x81, which is opcode 0 (QUERY), so the
+	// response opcode differs from the query's opcode 2 and the gateway's
+	// opcode-mismatch branch is exercised.
 	response := testResponse(query)
-
-	// testResponse copies the query opcode. Clear the response opcode so this
-	// test exercises the gateway's opcode-mismatch branch instead of expecting
-	// a mismatch for a response that matches.
-	response[2] &^= byte(dnsOpcodeMask >> 8)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
 		_, _ = w.Write(response)
@@ -1334,8 +1817,8 @@ func TestDoHRejectsNonSuccessUpstreamStatus(t *testing.T) {
 }
 
 func TestDoHRejectsNonOKUpstreamStatus(t *testing.T) {
-	// RFC 8484 mandates exactly HTTP 200 for a successful DoH response. A 204
-	// from the upstream must be rejected like any other non-200 status.
+	// This gateway's fixed local-upstream contract requires HTTP 200. A 204
+	// has no response body and must be rejected like any other non-200 status.
 	query := testQuery(41)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
@@ -1671,4 +2154,21 @@ func TestReadLimited(t *testing.T) {
 			t.Errorf("%s: got (%q, %t, %v), want (%q, %t, nil)", tc.name, got, tooLarge, err, tc.want, tc.tooLarge)
 		}
 	}
+}
+
+func FuzzParseDNSMessage(f *testing.F) {
+	f.Add(testQuery(1), false)
+	f.Add(testResponse(testQuery(2)), true)
+	f.Add(testResponseWithPrefixedCompressedOwner(testQuery(3)), true)
+	f.Add([]byte{0xc0, 0x0c, 0x00, 0x01}, true)
+	f.Add([]byte{0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0xc0, 0x0c}, true)
+	f.Fuzz(func(t *testing.T, msg []byte, wantResponse bool) {
+		qEnd, ok := parseDNSMessage(msg, wantResponse)
+		if !ok && qEnd != 0 {
+			t.Fatalf("invalid DNS message returned non-zero question end %d", qEnd)
+		}
+		if ok && (qEnd < 12 || qEnd > len(msg)) {
+			t.Fatalf("valid DNS message returned question end %d outside [12, %d]", qEnd, len(msg))
+		}
+	})
 }

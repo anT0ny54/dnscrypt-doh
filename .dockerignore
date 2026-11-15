@@ -1,9 +1,9 @@
 .git
 .gitignore
-.env
+**/.env*
+**/*.env*
 .github
 .dockerignore
-.env.example
 CHANGELOG.md
 README.md
 LICENSE

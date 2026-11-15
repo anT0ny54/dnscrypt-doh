@@ -51,7 +51,9 @@ const (
 	maxClientEntries        = 32768
 	maxDNSNameBytes         = 255
 	maxDNSRecords           = 4096
+	dnsTypeSIG              = 24
 	dnsTypeOPT              = 41
+	dnsTypeTSIG             = 250
 	dnsOpcodeMask           = 0x7800
 	shardCount              = 64
 	upstreamTimeout         = 6 * time.Second
@@ -94,10 +96,13 @@ type rateLimiter struct {
 	maxEntries int64
 	entries    atomic.Int64
 	// clockStart carries Go's monotonic clock reading. clockOffset stores the
-	// greatest observed wall-Unix-nanoseconds minus elapsed monotonic nanoseconds;
-	// adding elapsed time to that offset gives a clock that never moves back.
+	// greatest observed wall-Unix-nanoseconds minus elapsed monotonic nanoseconds.
+	// clockMax stores the greatest projected logical timestamp, so a caller
+	// delayed after sampling time.Now cannot publish an older clock value after
+	// another shard has already observed a newer one.
 	clockStart  time.Time
 	clockOffset atomic.Int64
+	clockMax    atomic.Int64
 }
 
 func newRateLimiter(limit, windowSec, maxEntries int) *rateLimiter {
@@ -124,21 +129,24 @@ func newRateLimiter(limit, windowSec, maxEntries int) *rateLimiter {
 		clockStart: started,
 	}
 	r.clockOffset.Store(startUnixNano)
+	r.clockMax.Store(startUnixNano)
 	return r
 }
 
 // logicalUnixSeconds combines wall time with the process-local monotonic clock.
 // The offset only moves forward, so a backwards wall-clock correction cannot
-// reset quotas. Unlike a frozen high-water timestamp, elapsed monotonic time
-// continues advancing Retry-After countdowns while the wall clock is behind.
+// reset quotas. Elapsed monotonic time keeps the clock advancing while the
+// wall clock is behind, so Retry-After countdowns continue to run.
 func (r *rateLimiter) logicalUnixSeconds() uint64 {
 	now := time.Now()
 	return r.logicalUnixSecondsAt(now.UnixNano(), now.Sub(r.clockStart).Nanoseconds())
 }
 
 // logicalUnixSecondsAt updates the forward-only wall/monotonic offset and
-// returns its projection at elapsedNano. Keeping this arithmetic separate
-// makes clock-step behavior deterministic in tests.
+// returns its non-decreasing projection at elapsedNano. The atomic maximum
+// also handles samples that reach this function out of order across shards.
+// Keeping this arithmetic separate makes clock-step behavior deterministic in
+// tests.
 func (r *rateLimiter) logicalUnixSecondsAt(wallUnixNano, elapsedNano int64) uint64 {
 	if wallUnixNano < 0 {
 		wallUnixNano = 0
@@ -154,6 +162,20 @@ func (r *rateLimiter) logicalUnixSecondsAt(wallUnixNano, elapsedNano int64) uint
 		}
 	}
 	logicalUnixNano := elapsedNano + r.clockOffset.Load()
+	// time.Now is sampled before this helper is entered. Under contention, a
+	// goroutine with an older sample can be delayed while another shard
+	// publishes a later timestamp. Clamp the projection with an atomic max so
+	// that stale samples cannot move quota windows or cleanup time backwards.
+	for {
+		previous := r.clockMax.Load()
+		if logicalUnixNano <= previous {
+			logicalUnixNano = previous
+			break
+		}
+		if r.clockMax.CompareAndSwap(previous, logicalUnixNano) {
+			break
+		}
+	}
 	if logicalUnixNano <= 0 {
 		return 0
 	}
@@ -263,9 +285,9 @@ func cleanupInterval(windowSec int) time.Duration {
 }
 
 func (r *rateLimiter) cleanup() {
-	// One logical-clock read serves the whole sweep. The high-water mark is
-	// shared with request admission, so a backwards wall-clock step during or
-	// after this sweep cannot make an expired entry current again.
+	// One logical-clock read serves the whole sweep. The forward-only logical
+	// clock is shared with request admission, so a backwards wall-clock step
+	// during or after this sweep cannot make an expired entry current again.
 	nowWindow := r.logicalUnixSeconds() / r.windowSec
 	for i := range r.shards {
 		sh := &r.shards[i]
@@ -476,13 +498,20 @@ func drainUpstreamErrorBody(resp *http.Response, limit int64) {
 // dnsNameEnd validates a DNS name, including compression pointers, and returns
 // the offset just past the name as it appears at the containing offset (the
 // position after the first pointer when the name jumps).
+//
+// A name may follow at most one compression pointer. Its target must be an
+// earlier, non-root label-length octet, and the target name must terminate
+// before the pointer itself. Rejecting terminators, other pointers, and target
+// labels that overlap the pointer avoids nested/overlapping chains and bounds
+// the expanded-name traversal. The expanded name length is capped at
+// maxDNSNameBytes.
 func dnsNameEnd(msg []byte, offset int) (int, bool) {
 	next := offset
 	jumped := false
-	jumps := 0
+	jumpLimit := len(msg)
 	nameLen := 0
 	for {
-		if offset >= len(msg) {
+		if offset >= len(msg) || (jumped && offset >= jumpLimit) {
 			return 0, false
 		}
 		labelLen := msg[offset]
@@ -497,28 +526,29 @@ func dnsNameEnd(msg []byte, offset int) (int, bool) {
 			}
 			return offset + 1, true
 		case labelLen&0xc0 == 0xc0:
-			if offset+1 >= len(msg) {
+			if offset+1 >= len(msg) || jumped {
 				return 0, false
 			}
 			pointer := int(labelLen&0x3f)<<8 | int(msg[offset+1])
-			// DNS compression pointers must point backwards to an earlier
-			// label occurrence. A forward pointer is not a valid DNS name.
+			// A pointer must target an earlier label-length octet, not the root
+			// terminator or another compression pointer. Requiring a non-zero
+			// label length also prevents nested pointer chains (RFC 9267, Section 2).
 			if pointer < 12 || pointer >= offset {
 				return 0, false
 			}
-			if !jumped {
-				next = offset + 2
-			}
-			jumped = true
-			offset = pointer
-			jumps++
-			if jumps > 128 {
+			targetLabelLen := msg[pointer]
+			if targetLabelLen == 0 || targetLabelLen >= 0x40 {
 				return 0, false
 			}
+			next = offset + 2
+			jumpLimit = offset
+			jumped = true
+			offset = pointer
 		case labelLen&0xc0 != 0:
 			return 0, false
 		default:
-			if offset+1+int(labelLen) > len(msg) {
+			labelEnd := offset + 1 + int(labelLen)
+			if labelEnd > len(msg) || (jumped && labelEnd > jumpLimit) {
 				return 0, false
 			}
 			nameLen += 1 + int(labelLen)
@@ -541,9 +571,10 @@ func dnsNameEndUncompressed(msg []byte, offset int) (int, bool) {
 		}
 		labelLen := msg[offset]
 		if labelLen == 0 {
-			// The label branch below rejects any name whose labels already
-			// total 255 bytes, so nameLen+1 (the root label) is at most 255
-			// here and needs no further length check.
+			// The label branch below rejects any name whose labels total 255 bytes
+			// or more, so the labels never exceed 254 bytes and nameLen+1 (the root
+			// label) fits within the 255-byte limit. No further length check is
+			// needed here.
 			return offset + 1, true
 		}
 		// Question names must be uncompressed. The 0x40 and 0x80 label forms
@@ -602,8 +633,9 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 	if qdCount != 1 {
 		return 0, false
 	}
-	// A query carries no answer or authority records. Additional records are
-	// only allowed for EDNS(0), whose resource type is OPT (41).
+	// A query carries no answer or authority records. This gateway's query
+	// profile accepts only EDNS(0) OPT in Additional; it does not authenticate
+	// TSIG- or SIG(0)-signed client queries, so those records are rejected.
 	if !wantResponse && (anCount != 0 || nsCount != 0) {
 		return 0, false
 	}
@@ -625,6 +657,7 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 	qEnd = offset
 
 	sections := [...]int{anCount, nsCount, arCount}
+	optSeen := false
 	for section, sectionCount := range sections {
 		for i := 0; i < sectionCount; i++ {
 			recordStart := offset
@@ -645,19 +678,33 @@ func parseDNSMessage(msg []byte, wantResponse bool) (qEnd int, ok bool) {
 				return 0, false
 			}
 			if rtype == dnsTypeOPT {
-				// EDNS permits a root-owned OPT pseudo-record only as the final
-				// record in the additional section. This also rejects duplicates:
-				// an earlier OPT cannot be final when another record follows.
+				// EDNS permits one root-owned OPT pseudo-record anywhere in the
+				// additional section. Other additional records (notably a final
+				// TSIG or SIG(0)) may follow it, so track uniqueness separately
+				// instead of requiring OPT to be the final record.
 				// A validated owner name of exactly one byte is necessarily the
 				// root label (0x00): regular labels and compression pointers
-				// each need at least two bytes, so an explicit zero-byte test
-				// would be unreachable.
-				if section != 2 || i != sectionCount-1 || ownerEnd != recordStart+1 {
+				// each need at least two bytes.
+				if section != 2 || optSeen || ownerEnd != recordStart+1 {
 					return 0, false
 				}
+				optSeen = true
 				if !validEDNSOptions(msg, rdataStart, rdataEnd) {
 					return 0, false
 				}
+			}
+			// RFC 8945 requires TSIG to be the final Additional record. RFC
+			// 2931 gives SIG(0) the same placement requirement; a SIG RR is a
+			// SIG(0) when its Type Covered field (the first two RDATA bytes) is
+			// zero. These checks preserve OPT's permitted placement flexibility
+			// without accepting a signature followed by another record.
+			if rtype == dnsTypeTSIG && (section != 2 || i != sectionCount-1) {
+				return 0, false
+			}
+			if rtype == dnsTypeSIG && rdataLen >= 2 &&
+				binary.BigEndian.Uint16(msg[rdataStart:rdataStart+2]) == 0 &&
+				(section != 2 || i != sectionCount-1) {
+				return 0, false
 			}
 		}
 	}
@@ -705,8 +752,8 @@ func dnsQuestionEqual(a []byte, aEnd int, b []byte, bEnd int) bool {
 
 // readLimited reads at most limit bytes from r and reports whether the source
 // held more than that. sizeHint (a Content-Length, or <= 0 when unknown)
-// pre-sizes the buffer so a typical DNS message is read without repeated
-// io.ReadAll growth.
+// pre-sizes the buffer to the advertised length, so a body that matches its
+// Content-Length is read without growing the buffer.
 func readLimited(r io.Reader, limit, sizeHint int64) (data []byte, tooLarge bool, err error) {
 	capacity := int64(512)
 	if sizeHint > 0 && sizeHint <= limit {
@@ -729,22 +776,28 @@ func readLimited(r io.Reader, limit, sizeHint int64) (data []byte, tooLarge bool
 // that is what bounds the decoded size of a GET query. The absolute
 // defaultMaxGetQuerySize ceiling is applied independently. The status return
 // is a non-zero HTTP status code on failure.
-func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, int) {
+func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, int, bool) {
 	var msg []byte
+	// bodyConsumed is true only when a POST body reached EOF. The caller uses
+	// this to decide whether it is safe to clear the short connection read
+	// deadline; early rejections and size-limit exits can leave unread bytes for
+	// net/http to discard after the handler returns.
+	bodyConsumed := false
 	if r.Method == http.MethodPost {
 		if !isDNSMessageContentType(r.Header.Get("Content-Type")) {
-			return nil, 0, http.StatusUnsupportedMediaType
+			return nil, 0, http.StatusUnsupportedMediaType, false
 		}
 		if r.ContentLength > maxBody {
-			return nil, 0, http.StatusRequestEntityTooLarge
+			return nil, 0, http.StatusRequestEntityTooLarge, false
 		}
 		body, tooLarge, err := readLimited(r.Body, maxBody, r.ContentLength)
 		if err != nil {
-			return nil, 0, http.StatusBadRequest
+			return nil, 0, http.StatusBadRequest, false
 		}
 		if tooLarge {
-			return nil, 0, http.StatusRequestEntityTooLarge
+			return nil, 0, http.StatusRequestEntityTooLarge, false
 		}
+		bodyConsumed = true
 		msg = body
 	} else {
 		// Fail fast only when a long raw query has no "&" separator. Extra
@@ -753,41 +806,41 @@ func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, 
 		// bounds the amount of query data parsed when multiple parameters exist.
 		rawQuery := r.URL.RawQuery
 		if len(rawQuery) > maxGetQueryFastFail && !strings.Contains(rawQuery, "&") {
-			return nil, 0, http.StatusRequestURITooLong
+			return nil, 0, http.StatusRequestURITooLong, false
 		}
 		values, err := url.ParseQuery(rawQuery)
 		if err != nil {
-			return nil, 0, http.StatusBadRequest
+			return nil, 0, http.StatusBadRequest, false
 		}
-		dnsValues, ok := values["dns"]
-		if !ok || len(dnsValues) != 1 || dnsValues[0] == "" {
-			return nil, 0, http.StatusBadRequest
+		dnsValues := values["dns"]
+		if len(dnsValues) != 1 || dnsValues[0] == "" {
+			return nil, 0, http.StatusBadRequest, false
 		}
 		encoded := dnsValues[0]
 		if len(encoded) > maxEncoded || len(encoded) > defaultMaxGetQuerySize {
-			return nil, 0, http.StatusRequestURITooLong
+			return nil, 0, http.StatusRequestURITooLong, false
 		}
 		// Go's base64 decoder ignores CR and LF, but raw base64url values in
 		// RFC 8484 query parameters must not contain line breaks. Reject them
 		// before decoding so malformed input cannot be silently normalized.
 		if strings.ContainsAny(encoded, "\r\n") {
-			return nil, 0, http.StatusBadRequest
+			return nil, 0, http.StatusBadRequest, false
 		}
 		// len(encoded) <= maxEncoded (= EncodedLen(maxBody)) already bounds the
 		// decoded length by maxBody, since raw base64url decodes to at most n*6/8
 		// bytes, so no separate decoded-size check is needed here.
 		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
 		if err != nil {
-			return nil, 0, http.StatusBadRequest
+			return nil, 0, http.StatusBadRequest, false
 		}
 		msg = decoded
 	}
 
 	qEnd, ok := parseDNSMessage(msg, false)
 	if !ok {
-		return nil, 0, http.StatusBadRequest
+		return nil, 0, http.StatusBadRequest, bodyConsumed
 	}
-	return msg, qEnd, 0
+	return msg, qEnd, 0, bodyConsumed
 }
 
 // upstreamReady reports whether the fixed loopback DoH upstream accepts TLS
@@ -875,6 +928,7 @@ type rootResponse struct {
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
+	boundUnreadRequestBody(w, r)
 	if !allowGetOrHead(w, r) {
 		return
 	}
@@ -890,6 +944,7 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) root(w http.ResponseWriter, r *http.Request) {
+	boundUnreadRequestBody(w, r)
 	if !allowGetOrHead(w, r) {
 		return
 	}
@@ -908,11 +963,22 @@ func unavailableRetryAfter1(w http.ResponseWriter, msg string) {
 	writeError(w, http.StatusServiceUnavailable, msg)
 }
 
+// boundUnreadRequestBody prevents net/http's post-handler body cleanup from
+// waiting for the full server ReadTimeout when a handler rejects a request or
+// leaves its body unused. A fully consumed DoH POST clears this deadline after
+// EOF so it cannot interfere with the upstream request.
+func boundUnreadRequestBody(w http.ResponseWriter, r *http.Request) {
+	if r.Body != nil && r.Body != http.NoBody {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
+	}
+}
+
 // doh handles requests for the configured DoH path only. ServeHTTP dispatches
 // matching paths here, and validateDoHPath keeps the reserved /health and /
 // paths free, so no additional path check is needed inside the handler.
 func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		boundUnreadRequestBody(w, r)
 		w.Header().Set("Allow", "GET, POST")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -925,6 +991,7 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	default:
+		boundUnreadRequestBody(w, r)
 		unavailableRetryAfter1(w, "server concurrency limit reached")
 		return
 	}
@@ -935,35 +1002,36 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	case rateAllowed:
 		// Continue with request validation and forwarding.
 	case rateExceeded:
+		boundUnreadRequestBody(w, r)
 		w.Header().Set("Retry-After", strconv.FormatUint(retryAfter, 10))
 		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	case rateCapacityReached:
+		boundUnreadRequestBody(w, r)
 		unavailableRetryAfter1(w, "client tracking capacity reached")
 		return
 	case rateInvalidAddress:
+		boundUnreadRequestBody(w, r)
 		unavailableRetryAfter1(w, "client IP address unavailable")
 		return
 	}
 
+	// Start the short read deadline only after admission succeeds, so time
+	// spent waiting for the rate-limit shard or scheduler does not consume the
+	// client's body-read budget. GET bodies are not part of DoH input and remain
+	// unread under the same bounded-cleanup deadline.
+	boundUnreadRequestBody(w, r)
 	isPost := r.Method == http.MethodPost
-	if isPost {
-		// The concurrency slot is already held, so a client trickling its body
-		// would pin it for the full ReadTimeout. A DNS message is at most a few
-		// KiB; bound the body read tightly. Best effort: the error is ignored
-		// for ResponseWriters that do not support read deadlines.
-		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
-	}
 
-	query, qEnd, status := readDNSQuery(r, s.maxBody, s.maxEncoded)
-	if isPost {
-		// Clear the short body deadline now that the body has been read. Once
-		// the body hits EOF, net/http starts a background read on the
-		// connection to detect client disconnects; if the 2-second deadline
-		// were still armed, that read would time out while the request waits
-		// for the upstream and net/http would cancel the request context,
-		// aborting valid slow lookups with a 502. The upstream exchange is
-		// bounded by its own context (upstreamTimeout) instead.
+	query, qEnd, status, bodyConsumed := readDNSQuery(r, s.maxBody, s.maxEncoded)
+	if isPost && bodyConsumed {
+		// Clear the short body deadline only after reaching EOF. Once the body
+		// has been consumed, net/http starts a background read on the connection
+		// to detect client disconnects; leaving the 2-second deadline armed would
+		// time out that read while the request waits for the upstream and cancel
+		// valid slow lookups. For early rejections or oversized streaming bodies,
+		// keep the deadline armed so net/http's post-handler body discard cannot
+		// be held open indefinitely by an unfinished client upload.
 		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
 	}
 	if status != 0 {
@@ -1002,9 +1070,9 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// net/http consumes interim 1xx responses, so the final status is always
-	// >= 200. RFC 8484 mandates exactly 200 for a successful DoH response, so
-	// reject anything else.
+	// net/http consumes interim 1xx responses. RFC 8484 describes 2xx status
+	// codes for valid DNS responses, but this gateway deliberately requires
+	// exactly 200 from its fixed local dnscrypt-proxy integration.
 	if resp.StatusCode != http.StatusOK {
 		drainUpstreamErrorBody(resp, s.maxBody)
 		writeError(w, http.StatusBadGateway, "dns upstream returned an invalid HTTP status")
@@ -1076,6 +1144,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// escaped path differs from Go's canonical escaping of Path; reject those
 	// aliases rather than silently normalizing them.
 	if r.URL.RawPath != "" {
+		boundUnreadRequestBody(w, r)
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -1088,6 +1157,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/":
 		s.root(w, r)
 	default:
+		boundUnreadRequestBody(w, r)
 		writeError(w, http.StatusNotFound, "not found")
 	}
 }
@@ -1104,10 +1174,11 @@ func healthcheckURL() string {
 // 200 from making the container appear healthy.
 func runHealthcheck(target string) int {
 	client := &http.Client{
-		// This probe is only for the gateway's local listener. Do not route it
-		// through an environment-configured proxy or follow a redirect to some
-		// other service that could produce a false-positive health result.
-		Transport: &http.Transport{Proxy: nil},
+		// This probe is only for the gateway's local listener. A zero-value
+		// Transport never reads proxy settings from the environment, and
+		// redirects are not followed, so a redirect to some other service
+		// cannot produce a false-positive health result.
+		Transport: &http.Transport{},
 		Timeout:   2 * time.Second,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -1135,6 +1206,23 @@ func runHealthcheck(target string) int {
 	return 0
 }
 
+// newUpstreamTransport bounds upstream connection concurrency and response
+// headers. The upstream is a fixed local service, but malformed or unexpected
+// headers should not consume substantially more memory than inbound headers.
+func newUpstreamTransport(concurrency int) *http.Transport {
+	return &http.Transport{
+		// Proxy is left nil (the zero value), so the loopback upstream never
+		// uses an environment-configured proxy.
+		TLSClientConfig:        loopbackTLSConfig,
+		MaxIdleConns:           concurrency,
+		MaxIdleConnsPerHost:    concurrency,
+		MaxConnsPerHost:        concurrency,
+		IdleConnTimeout:        30 * time.Second,
+		DisableCompression:     true,
+		MaxResponseHeaderBytes: int64(defaultMaxHeaderBytes),
+	}
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
 		os.Exit(runHealthcheck(healthcheckURL()))
@@ -1157,16 +1245,7 @@ func main() {
 	// doh (upstreamTimeout). Do not also set http.Client.Timeout or
 	// ResponseHeaderTimeout here, or partial timeout behavior becomes hard to
 	// reason about.
-	transport := &http.Transport{
-		// No Proxy: the loopback upstream must never go through an
-		// environment-configured proxy.
-		TLSClientConfig:     loopbackTLSConfig,
-		MaxIdleConns:        concLimit,
-		MaxIdleConnsPerHost: concLimit,
-		MaxConnsPerHost:     concLimit,
-		IdleConnTimeout:     30 * time.Second,
-		DisableCompression:  true,
-	}
+	transport := newUpstreamTransport(concLimit)
 
 	s := &server{
 		client: &http.Client{
