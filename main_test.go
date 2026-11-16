@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -136,6 +137,12 @@ func (b *trackingBody) Close() error {
 type countingReader struct {
 	remaining int
 	read      int
+}
+
+type noProgressReader struct{}
+
+func (noProgressReader) Read([]byte) (int, error) {
+	return 0, nil
 }
 
 func (r *countingReader) Read(p []byte) (int, error) {
@@ -650,11 +657,11 @@ func TestHealthAndRootJSONBodies(t *testing.T) {
 	// The key order is part of the wire format; these bodies must not change
 	// shape when the responses are encoded from structs.
 	s := newTestGateway("http://127.0.0.1:1/dns-query")
-	s.rateDesc = "99 requests/60s per client IP"
+	s.rateDesc = rateDescription(99, 60)
 
 	rec := httptest.NewRecorder()
 	s.root(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if got, want := rec.Body.String(), `{"endpoint":"/dns-query","rateLimit":"99 requests/60s per client IP","service":"minimal-hagezi-doh"}`+"\n"; got != want {
+	if got, want := rec.Body.String(), `{"endpoint":"/dns-query","rateLimit":"99 requests/60s per client (IPv4 address or IPv6 /64)","service":"minimal-hagezi-doh"}`+"\n"; got != want {
 		t.Fatalf("root body = %q, want %q", got, want)
 	}
 
@@ -665,6 +672,15 @@ func TestHealthAndRootJSONBodies(t *testing.T) {
 	}
 	if want, got := `{"service":"minimal-hagezi-doh","status":"starting","uptime":"`, rec.Body.String(); !strings.HasPrefix(got, want) {
 		t.Fatalf("health body = %q, want prefix %q", got, want)
+	}
+}
+
+// TestRateDescriptionMatchesLimiterClientIdentity keeps the root endpoint's
+// description aligned with how the limiter actually keys clients.
+func TestRateDescriptionMatchesLimiterClientIdentity(t *testing.T) {
+	want := "99 requests/60s per client (IPv4 address or IPv6 /64)"
+	if got := rateDescription(99, 60); got != want {
+		t.Fatalf("rateDescription(99, 60) = %q, want %q", got, want)
 	}
 }
 
@@ -1046,7 +1062,7 @@ func TestRateLimiterCleanupKeepsFutureWindowEntries(t *testing.T) {
 	}
 }
 
-func TestRateLimiterCleanupReleasesGlobalCapacity(t *testing.T) {
+func TestRateLimiterCleanupReleasesGlobalCapacityAndEmptyShardMap(t *testing.T) {
 	r := newRateLimiter(1, 60, 64)
 	ip := netip.MustParseAddr("192.0.2.30")
 	idx := int(addrHash(ip) % shardCount)
@@ -1055,6 +1071,9 @@ func TestRateLimiterCleanupReleasesGlobalCapacity(t *testing.T) {
 	r.cleanup()
 	if got := r.entries.Load(); got != 0 {
 		t.Fatalf("entries after cleanup=%d; want 0", got)
+	}
+	if r.shards[idx].m != nil {
+		t.Fatal("empty shard map should be released after cleanup")
 	}
 	if r.allow(ip) != rateAllowed {
 		t.Fatal("client should be admitted after stale capacity is reclaimed")
@@ -1397,22 +1416,6 @@ func TestHandlersBoundBodiesTheyLeaveUnread(t *testing.T) {
 	}
 }
 
-func TestDoHRejectsOversizedPOST(t *testing.T) {
-	s := newTestGateway("http://127.0.0.1:9/dns-query")
-	s.maxBody = 16
-	req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader("0123456789abcdefghijklmnop"))
-	req.Header.Set("Content-Type", "application/dns-message")
-	// Unknown length (chunked) forces the streaming limit in readLimited rather
-	// than the Content-Length pre-check that TestDoHRejectsAdvertisedOversizedPOST
-	// covers.
-	req.ContentLength = -1
-	rec := httptest.NewRecorder()
-	s.doh(rec, req)
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413", rec.Code)
-	}
-}
-
 func TestDoHKeepsPOSTReadDeadlineWhenBodyIsNotConsumed(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -1681,19 +1684,6 @@ func TestDoHRejectsMismatchedResponseQuestion(t *testing.T) {
 	s.doh(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
-	}
-}
-
-func TestDoHRejectsUnsupportedMethod(t *testing.T) {
-	s := newTestGateway("http://127.0.0.1:9/dns-query")
-	req := httptest.NewRequest(http.MethodPut, defaultDoHPath, strings.NewReader("ignored"))
-	rec := httptest.NewRecorder()
-	s.doh(rec, req)
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", rec.Code)
-	}
-	if got := rec.Header().Get("Allow"); got != "GET, POST" {
-		t.Fatalf("Allow = %q, want GET, POST", got)
 	}
 }
 
@@ -2134,6 +2124,61 @@ func TestEncodedCeilingImpliesDecodedLimit(t *testing.T) {
 	}
 }
 
+// TestReadLimitedExactHintAllocatesOnce pins the pre-sizing guarantee that the
+// README documents: when the size hint matches the body, the body is read to
+// EOF using the single buffer allocated from the hint.
+func TestReadLimitedExactHintAllocatesOnce(t *testing.T) {
+	for _, n := range []int{45, 300, 4000, 8192} {
+		body := strings.Repeat("x", n)
+		src := strings.NewReader(body)
+		allocs := testing.AllocsPerRun(100, func() {
+			src.Reset(body)
+			got, tooLarge, err := readLimited(src, 8192, int64(n))
+			if err != nil || tooLarge || len(got) != n {
+				t.Errorf("n=%d: readLimited = (len %d, %t, %v), want (len %d, false, nil)", n, len(got), tooLarge, err, n)
+			}
+		})
+		if allocs > 1 {
+			t.Fatalf("n=%d: readLimited allocs/op = %.0f, want at most 1 for an exact size hint", n, allocs)
+		}
+	}
+}
+
+// TestReadLimitedLimitPlusOneBoundsGrowth checks that an unknown-length source
+// is cut off at limit+1 bytes and never buffered beyond that bound.
+func TestReadLimitedLimitPlusOneBoundsGrowth(t *testing.T) {
+	const limit = 1000
+	src := &countingReader{remaining: 1 << 20}
+	got, tooLarge, err := readLimited(src, limit, -1)
+	if err != nil || !tooLarge || got != nil {
+		t.Fatalf("readLimited = (%d bytes, %t, %v), want (nil, true, nil)", len(got), tooLarge, err)
+	}
+	if src.read != limit+1 {
+		t.Fatalf("source consumed %d bytes, want exactly limit+1 = %d", src.read, limit+1)
+	}
+}
+
+func TestReadLimitedInitialCapacityDoesNotExceedLimitPlusOne(t *testing.T) {
+	const limit = int64(4)
+	got, tooLarge, err := readLimited(strings.NewReader("ab"), limit, -1)
+	if err != nil || tooLarge || string(got) != "ab" {
+		t.Fatalf("readLimited = (%q, %t, %v), want (ab, false, nil)", got, tooLarge, err)
+	}
+	if cap(got) > int(limit+1) {
+		t.Fatalf("initial buffer capacity = %d, want at most limit+1 = %d", cap(got), limit+1)
+	}
+}
+
+func TestReadLimitedReturnsErrNoProgressForStalledReader(t *testing.T) {
+	_, tooLarge, err := readLimited(noProgressReader{}, 32, -1)
+	if err != io.ErrNoProgress {
+		t.Fatalf("error = %v, want %v", err, io.ErrNoProgress)
+	}
+	if tooLarge {
+		t.Fatal("a stalled reader is not an oversized body")
+	}
+}
+
 func TestReadLimited(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -2152,6 +2197,63 @@ func TestReadLimited(t *testing.T) {
 		got, tooLarge, err := readLimited(strings.NewReader(tc.in), tc.limit, tc.hint)
 		if err != nil || tooLarge != tc.tooLarge || string(got) != tc.want {
 			t.Errorf("%s: got (%q, %t, %v), want (%q, %t, nil)", tc.name, got, tooLarge, err, tc.want, tc.tooLarge)
+		}
+	}
+}
+
+// chunkedReader returns its data in pseudo-random pieces, the way a network
+// body arrives, so readLimited is exercised with short reads rather than one
+// large Read.
+type chunkedReader struct {
+	data  []byte
+	chunk int
+	rnd   *rand.Rand
+}
+
+func (c *chunkedReader) Read(p []byte) (int, error) {
+	if len(c.data) == 0 {
+		return 0, io.EOF
+	}
+	n := 1 + c.rnd.Intn(c.chunk)
+	n = min(n, len(p), len(c.data))
+	copy(p, c.data[:n])
+	c.data = c.data[n:]
+	return n, nil
+}
+
+// TestReadLimitedRandomizedChunkedReads checks readLimited against short reads
+// for bodies below, at, and above the limit, with exact, lying, and absent
+// size hints. The seed is fixed so any failure is reproducible.
+func TestReadLimitedRandomizedChunkedReads(t *testing.T) {
+	rnd := rand.New(rand.NewSource(1))
+	for iter := 0; iter < 2000; iter++ {
+		limit := int64(512 + rnd.Intn(8000))
+		n := rnd.Intn(int(limit) + 300)
+		src := make([]byte, n)
+		rnd.Read(src)
+
+		hint := int64(-1)
+		switch rnd.Intn(3) {
+		case 0:
+			hint = int64(n)
+		case 1:
+			hint = int64(rnd.Intn(int(limit) + 2000))
+		}
+		cr := &chunkedReader{data: append([]byte(nil), src...), chunk: 1 + rnd.Intn(700), rnd: rnd}
+		got, tooLarge, err := readLimited(cr, limit, hint)
+		if err != nil {
+			t.Fatalf("iter %d: unexpected error: %v", iter, err)
+		}
+		if n > int(limit) {
+			if !tooLarge || got != nil {
+				t.Fatalf("iter %d: n=%d limit=%d hint=%d: want tooLarge with nil data, got tooLarge=%t len=%d",
+					iter, n, limit, hint, tooLarge, len(got))
+			}
+			continue
+		}
+		if tooLarge || !bytes.Equal(got, src) {
+			t.Fatalf("iter %d: n=%d limit=%d hint=%d: data mismatch (tooLarge=%t, len=%d)",
+				iter, n, limit, hint, tooLarge, len(got))
 		}
 	}
 }

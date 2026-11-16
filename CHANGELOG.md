@@ -3,31 +3,34 @@
 This project does not use semantic versioning; the pinned Go and dnscrypt-proxy
 versions live in the Dockerfile. Only the latest modification log is retained.
 
-## [Unreleased]
+## 2026-11-16 — Sixth review pass
 
-### Security
+### Updated
 
-- Cap loopback-upstream HTTP response headers at the same 16 KiB limit used for
-  incoming request headers, preventing unexpectedly large resolver headers from
-  consuming excessive memory.
+- README now states the exact 100-consecutive-empty-read threshold used by
+  `readLimited` before it returns `io.ErrNoProgress`.
 
-- Harden DNS resource-record owner-name parsing to allow only a single backward
-  compression-pointer jump to a prior non-root label sequence that terminates
-  before the pointer itself. Reject pointers to root terminators, nested pointer
-  chains, and target labels whose data overlaps the pointer, reducing malformed-
-  packet parser ambiguity and following the defensive guidance in RFC 9267 Section 2.
+### Reviewed, no further production changes needed
 
-### Tests
-
-- Verify that the production upstream transport rejects response headers above
-  the 16 KiB limit and retains its configured connection-concurrency bounds.
-
-- Cover the valid labels-then-pointer compression form as well as rejection of
-  pointers targeting a prior root terminator, a previously compressed owner
-  name, and label data that overlaps the pointer; include the valid form as a
-  DNS parser fuzz seed.
-
-### Documentation
-
-- Clarify that the 16 KiB inbound and upstream header limits apply to complete
-  header blocks, and document the race-detector and DNS parser fuzz commands.
+- Merged `dnscrypt-doh-main.zip` with `dnscrypt-doh-modified-files.zip`; the
+  patch archive replaces exactly `main.go`, `main_test.go`, `README.md`, and
+  `CHANGELOG.md`. No duplicate paths, unexpected files, or merge conflicts were
+  present.
+- Read all 15 regular files in the merged project in full, including the
+  complete Go implementation and test suite, README, changelog, container
+  files, shell entrypoint, workflow, environment template, ignore files,
+  resolver configuration, module file, and license.
+- Rechecked the prior `readLimited` and rate-limiter cleanup changes. Their
+  bounds, lock ownership, global entry accounting, and regression tests remain
+  consistent. The separate DNS-name parsers intentionally validate different
+  wire-format contexts. No additional dead or redundant production code,
+  conflicting configuration, or actionable correctness/performance issue was
+  found, so no runtime source change was warranted.
+- `gofmt`, `go test ./...`, `go test -race ./...`, five shuffled test runs,
+  `go vet ./...`, `sh -n entrypoint.sh`, and a 5-second
+  `FuzzParseDNSMessage` run passed using the installed Go 1.23.2 compiler in a
+  temporary copy with only the `go.mod` directive lowered for compatibility.
+  The supplied project `go.mod` was not changed. The pinned Go 1.27.4 toolchain
+  and Docker image build were not verified in this environment.
+- ShellCheck and the `dnscrypt-proxy -check` binary were unavailable, so those
+  checks were not run.

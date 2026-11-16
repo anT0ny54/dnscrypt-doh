@@ -63,6 +63,7 @@ const (
 	upstreamProbeTimeout    = 500 * time.Millisecond
 	upstreamProbeCacheTTL   = 2 * time.Second
 	maxHealthcheckBodyBytes = 4096
+	maxReadNoProgress       = 100
 	shutdownGrace           = 5 * time.Second
 	maxCleanupIntervalSec   = 30
 )
@@ -299,6 +300,11 @@ func (r *rateLimiter) cleanup() {
 				delete(sh.m, k)
 				r.entries.Add(-1)
 			}
+		}
+		// A shard that has become empty no longer needs to retain its map
+		// buckets. Future clients will allocate a fresh map under this lock.
+		if len(sh.m) == 0 {
+			sh.m = nil
 		}
 		sh.mu.Unlock()
 	}
@@ -752,21 +758,62 @@ func dnsQuestionEqual(a []byte, aEnd int, b []byte, bEnd int) bool {
 
 // readLimited reads at most limit bytes from r and reports whether the source
 // held more than that. sizeHint (a Content-Length, or <= 0 when unknown)
-// pre-sizes the buffer to the advertised length, so a body that matches its
-// Content-Length is read without growing the buffer.
+// pre-sizes the buffer to the advertised length plus one spare byte. The spare
+// byte lets the loop observe io.EOF without growing, so a body that matches its
+// Content-Length is read to EOF in a single allocation. A missing or oversized
+// hint starts at min(512, limit+1) bytes and doubles, never past limit+1, so a
+// lying hint or a small limit cannot cause an oversized allocation. Repeated
+// zero-byte reads without an error are bounded by maxReadNoProgress.
+//
+// The loop reads directly instead of using bytes.Buffer.ReadFrom: ReadFrom
+// demands 512 free bytes before every read, so it reallocated even when the
+// hint was exact.
 func readLimited(r io.Reader, limit, sizeHint int64) (data []byte, tooLarge bool, err error) {
-	capacity := int64(512)
+	maxRead := limit + 1
+	capacity := min(int64(512), maxRead)
 	if sizeHint > 0 && sizeHint <= limit {
 		capacity = sizeHint + 1
 	}
-	buf := bytes.NewBuffer(make([]byte, 0, capacity))
-	if _, err = buf.ReadFrom(io.LimitReader(r, limit+1)); err != nil {
-		return nil, false, err
+	buf := make([]byte, 0, capacity)
+	emptyReads := 0
+	for {
+		if len(buf) == cap(buf) {
+			next := min(int64(cap(buf))*2, maxRead)
+			grown := make([]byte, len(buf), next)
+			copy(grown, buf)
+			buf = grown
+		}
+		// Never read past limit+1 bytes in total: the extra byte is only a
+		// marker that the source is too large.
+		room := maxRead - int64(len(buf))
+		p := buf[len(buf):cap(buf)]
+		if int64(len(p)) > room {
+			p = p[:room]
+		}
+		n, rerr := r.Read(p)
+		buf = buf[:len(buf)+n]
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return nil, false, rerr
+		}
+		if n == 0 {
+			emptyReads++
+			if emptyReads >= maxReadNoProgress {
+				return nil, false, io.ErrNoProgress
+			}
+			continue
+		}
+		emptyReads = 0
+		if int64(len(buf)) >= maxRead {
+			break
+		}
 	}
-	if int64(buf.Len()) > limit {
+	if int64(len(buf)) > limit {
 		return nil, true, nil
 	}
-	return buf.Bytes(), false, nil
+	return buf, false, nil
 }
 
 // readDNSQuery extracts and validates the DNS wire message from a DoH
@@ -910,6 +957,13 @@ func allowGetOrHead(w http.ResponseWriter, r *http.Request) bool {
 	w.Header().Set("Allow", "GET, HEAD")
 	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	return false
+}
+
+// rateDescription is the root endpoint's rate-limit line. The client identity
+// matches the limiter's keying: an IPv4 address, or the /64 prefix of an IPv6
+// address. The line is formatted once at startup and reused for every request.
+func rateDescription(limit, windowSec int) string {
+	return fmt.Sprintf("%d requests/%ds per client (IPv4 address or IPv6 /64)", limit, windowSec)
 }
 
 // healthResponse and rootResponse have fixed fields, so typed structs replace
@@ -1264,7 +1318,7 @@ func main() {
 		maxBody:      int64(maxBody),
 		maxEncoded:   base64.RawURLEncoding.EncodedLen(maxBody),
 		trustProxy:   trustProxy,
-		rateDesc:     fmt.Sprintf("%d requests/%ds per client IP", rateLimit, rateWindow),
+		rateDesc:     rateDescription(rateLimit, rateWindow),
 		started:      time.Now(),
 	}
 
