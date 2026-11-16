@@ -1,5 +1,4 @@
 # Local environment overrides and variants (keep the committed template).
-.env*
 *.env*
 !/.env.example
 
