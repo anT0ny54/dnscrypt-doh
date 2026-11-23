@@ -514,7 +514,9 @@ func drainUpstreamErrorBody(resp *http.Response, limit int64) {
 func dnsNameEnd(msg []byte, offset int) (int, bool) {
 	next := offset
 	jumped := false
-	jumpLimit := len(msg)
+	// jumpLimit is only read after a pointer sets it (jumped is true), so it
+	// needs no initial value.
+	var jumpLimit int
 	nameLen := 0
 	for {
 		if offset >= len(msg) || (jumped && offset >= jumpLimit) {
@@ -816,6 +818,13 @@ func readLimited(r io.Reader, limit, sizeHint int64) (data []byte, tooLarge bool
 	return buf, false, nil
 }
 
+// dnsQueryEncoding decodes the GET dns parameter: RFC 4648 base64url without
+// padding, in strict mode. The default decoder ignores the unused padding bits
+// of the final character, so a non-canonical spelling decoded to the same DNS
+// message and produced a second, distinct GET URL for it. Strict mode rejects
+// those spellings, so each message has exactly one accepted GET form.
+var dnsQueryEncoding = base64.RawURLEncoding.Strict()
+
 // readDNSQuery extracts and validates the DNS wire message from a DoH
 // request, returning the message along with qEnd, the offset just past its
 // question section, so the caller can compare question sections without a
@@ -876,7 +885,7 @@ func readDNSQuery(r *http.Request, maxBody int64, maxEncoded int) ([]byte, int, 
 		// len(encoded) <= maxEncoded (= EncodedLen(maxBody)) already bounds the
 		// decoded length by maxBody, since raw base64url decodes to at most n*6/8
 		// bytes, so no separate decoded-size check is needed here.
-		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+		decoded, err := dnsQueryEncoding.DecodeString(encoded)
 		if err != nil {
 			return nil, 0, http.StatusBadRequest, false
 		}
@@ -1075,10 +1084,11 @@ func (s *server) doh(w http.ResponseWriter, r *http.Request) {
 	// client's body-read budget. GET bodies are not part of DoH input and remain
 	// unread under the same bounded-cleanup deadline.
 	boundUnreadRequestBody(w, r)
-	isPost := r.Method == http.MethodPost
 
 	query, qEnd, status, bodyConsumed := readDNSQuery(r, s.maxBody, s.maxEncoded)
-	if isPost && bodyConsumed {
+	// bodyConsumed is only ever set for POST, so it alone identifies a body
+	// that reached EOF.
+	if bodyConsumed {
 		// Clear the short body deadline only after reaching EOF. Once the body
 		// has been consumed, net/http starts a background read on the connection
 		// to detect client disconnects; leaving the 2-second deadline armed would
@@ -1232,8 +1242,12 @@ func runHealthcheck(target string) int {
 		// Transport never reads proxy settings from the environment, and
 		// redirects are not followed, so a redirect to some other service
 		// cannot produce a false-positive health result.
-		Transport: &http.Transport{},
-		Timeout:   2 * time.Second,
+		Transport: &http.Transport{
+			// The health endpoint is local, but a wrong listener on this port
+			// must not make a one-shot probe accept the transport's much larger default header allowance.
+			MaxResponseHeaderBytes: defaultMaxHeaderBytes,
+		},
+		Timeout: 2 * time.Second,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

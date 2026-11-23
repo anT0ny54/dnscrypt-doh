@@ -779,6 +779,19 @@ func TestRunHealthcheckRejectsOversized200Response(t *testing.T) {
 	}
 }
 
+func TestRunHealthcheckRejectsOversizedResponseHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Oversized", strings.Repeat("x", defaultMaxHeaderBytes))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"service":"minimal-hagezi-doh","status":"ok","uptime":"1s"}`)
+	}))
+	defer server.Close()
+
+	if got := runHealthcheck(server.URL); got != 1 {
+		t.Fatalf("oversized response headers: runHealthcheck = %d, want 1", got)
+	}
+}
+
 func TestRateLimiterAllocatesShardMapsLazily(t *testing.T) {
 	r := newRateLimiter(1, 60, 256)
 	for i := range r.shards {
@@ -1218,6 +1231,31 @@ func TestReadDNSQueryRejectsBase64URLLineBreaks(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?dns="+encoded[:mid]+"%0A"+encoded[mid:], nil)
 	if _, _, status, _ := readDNSQuery(req, defaultMaxBodyBytes, base64.RawURLEncoding.EncodedLen(defaultMaxBodyBytes)); status != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for a line break inside the base64url value", status)
+	}
+}
+
+func TestReadDNSQueryRejectsNonCanonicalBase64URL(t *testing.T) {
+	// The two spellings differ only in the final character. Its low two bits
+	// are unused padding: the canonical form sets them to zero, the alternate
+	// sets them to one. The lenient decoder maps both to the same message.
+	canonical := "EgEBAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
+	alternate := "EgEBAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAF"
+	query := testQuery(1)
+
+	if got, err := base64.RawURLEncoding.DecodeString(alternate); err != nil || !bytes.Equal(got, query) {
+		t.Fatalf("premise failed: lenient decoder of alternate = (%x, %v), want the query bytes", got, err)
+	}
+	maxEncoded := base64.RawURLEncoding.EncodedLen(defaultMaxBodyBytes)
+
+	req := httptest.NewRequest(http.MethodGet, defaultDoHPath+"?dns="+canonical, nil)
+	got, _, status, _ := readDNSQuery(req, defaultMaxBodyBytes, maxEncoded)
+	if status != 0 || !bytes.Equal(got, query) {
+		t.Fatalf("canonical spelling: status = %d, want accepted", status)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, defaultDoHPath+"?dns="+alternate, nil)
+	if _, _, status, _ := readDNSQuery(req, defaultMaxBodyBytes, maxEncoded); status != http.StatusBadRequest {
+		t.Fatalf("non-canonical spelling: status = %d, want 400", status)
 	}
 }
 

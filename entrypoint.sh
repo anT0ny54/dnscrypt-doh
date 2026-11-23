@@ -67,10 +67,10 @@ dns_pid=$!
 gateway_pid=$!
 
 # Poll only process state, not readiness. A 500 ms interval detects a service
-# exit promptly without forking `sleep` ten times a second on a 0.25 vCPU
-# container, and without depending on non-portable or shell-version-sensitive
-# wait -n behavior. Explicit wait calls reap whichever child has exited before
-# cleanup.
+# exit promptly while forking `sleep` only twice a second (a 100 ms interval
+# would fork it ten times a second on a 0.25 vCPU container), and it avoids
+# depending on non-portable or shell-version-sensitive wait -n behavior.
+# Explicit wait calls reap whichever child has exited before cleanup.
 while :; do
   if ! child_running "$dns_pid"; then
     wait "$dns_pid" 2>/dev/null || true
