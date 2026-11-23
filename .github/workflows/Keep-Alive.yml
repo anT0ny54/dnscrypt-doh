@@ -20,35 +20,53 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          # The later git fetch/push commands need the checkout token.
+          persist-credentials: true
 
-      - name: Update keep-alive file
+      - name: Commit and push keep-alive update
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          printf 'Last kept alive on: %s\n' "$timestamp" \
-            > keep-alive.txt
-
-      - name: Commit and push if changed
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+          if [[ "${GITHUB_REF}" != refs/heads/* ]]; then
+            echo "Keep-alive workflow must run on a branch, not ${GITHUB_REF}" >&2
+            exit 1
+          fi
+          branch="${GITHUB_REF#refs/heads/}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -- keep-alive.txt
+          # Rebuild the timestamp commit from the latest remote tip on every
+          # attempt. This avoids both non-fast-forward races and rebase
+          # conflicts when another commit also changes keep-alive.txt.
+          for attempt in 1 2 3; do
+            git fetch --quiet origin "refs/heads/${branch}"
+            git reset --hard --quiet FETCH_HEAD
 
-          if git diff --cached --quiet -- keep-alive.txt; then
-            echo "No changes to commit"
-            exit 0
-          fi
+            timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            printf 'Last kept alive on: %s\n' "$timestamp" > keep-alive.txt
+            git add -- keep-alive.txt
 
-          git commit \
-            -m "chore: update repository keep-alive [skip ci]"
+            if git diff --cached --quiet -- keep-alive.txt; then
+              echo "No changes to commit"
+              exit 0
+            fi
 
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+            git commit -m "chore: update repository keep-alive [skip ci]"
+
+            if git push origin "HEAD:refs/heads/${branch}"; then
+              exit 0
+            fi
+
+            if [[ "$attempt" -lt 3 ]]; then
+              echo "Push rejected; fetching latest branch and retrying (attempt $((attempt + 1))/3)" >&2
+              sleep "$attempt"
+            fi
+          done
+
+          echo "Unable to push keep-alive commit after 3 attempts" >&2
+          exit 1
