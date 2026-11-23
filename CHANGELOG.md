@@ -1,58 +1,57 @@
 # Changelog
 
-This project does not use semantic versioning; the pinned Go and dnscrypt-proxy
-versions live in the Dockerfile. Only the latest modification log is retained.
+This project does not use semantic versioning. Pinned component versions are
+recorded in the Dockerfile. Only the latest modification log is retained.
 
-### Retained fixes
+## Latest modification — 2026-11-23
 
-- The one-shot `-healthcheck` client caps response headers at 16 KiB, matching
-the gateway and upstream client.
-- The `GET` `dns` parameter uses `base64.RawURLEncoding.Strict()` so non-canonical
-base64url spellings are rejected rather than aliasing the same DNS message.
-- DNS compression-pointer parsing bounds backward offsets and rejects nested
-pointer jumps; the existing parser and regression tests cover malformed and
-boundary cases.
-- Request bodies, response bodies, and HTTP header blocks remain bounded, and
-health-check / upstream requests keep their explicit deadlines.
-- The shell entrypoint's startup, signal handling, and peer-process cleanup
-behavior remain covered by the existing supervision logic and tests.
+### Changed
 
-### Reviewed, no further code change needed
+- `README.md`: corrected the shutdown-race explanation. Tini's default mode
+  forwards signals to its direct child; container teardown, not Tini itself,
+  removes any process left behind if a signal lands between a child fork and
+  PID registration.
+- `CHANGELOG.md`: replaced the prior entry with this latest review log.
 
-- The full gateway and test sources were reviewed for dead or redundant code,
-conflicts, correctness defects, DNS parser edge cases, concurrency, resource
-limits, and safe optimization opportunities. No additional unreferenced
-production declarations, reproducible production bugs, or justified production
-code optimizations were found, so no speculative source changes were made.
-- The README test commands now use `-count=1` so the documented test runs bypass
-the Go test cache. The project module directive remains `go 1.27`.
-- The TOML/YAML configuration parses cleanly, and the three DNS stamps decode
-to the addresses, hostnames, and `/dns-query` paths documented in the README.
-- A BusyBox `ash` supervision smoke test with stub child processes verified
-startup, gateway-before-DNS shutdown ordering, and cleanup after an unexpected
-gateway exit. This is a shell-level smoke test, not a full container test.
+### Review
+
+- Reassembled `dnscrypt-doh-main.zip` with the Pass 4 and Pass 6 overlays and
+  read all 15 files in full (4,426 newline-terminated lines).
+- No confirmed dead production code, unused helpers, redundant test helpers,
+  Go gateway defects, or conflicting settings were found. No Go source changes
+  or code removals were justified.
+- No further runtime optimization was justified without representative load
+  measurements and benchmarks.
+- Rechecked the Pass 4 keep-alive workflow. A shallow-clone simulation forced
+  a competing commit to change `keep-alive.txt` immediately before the first
+  push; the first push was rejected, and the retry fetched the new tip, retained
+  the competing commit in history, and successfully pushed a fresh timestamp.
+- Verified that all three DNS stamps decode to the IP/hostname pairs listed in
+  the README. The Dockerfile's combined PEM output was also tested locally and
+  contains both a parseable private key and certificate.
 
 ### Verified
 
-- `gofmt -l`, `go vet ./...`, `go test -count=1 ./...`,
-`go test -race -count=1 ./...`, and `go test -cover -count=1 ./...` pass;
-statement coverage is 84.8%.
-- An 8-second `FuzzParseDNSMessage` run completed without failures (119,317
-executions).
-- Native `linux/amd64` and cross-compiled `linux/arm64` builds pass with
-`CGO_ENABLED=0`.
-- `sh -n entrypoint.sh` and `busybox ash -n entrypoint.sh` pass. The TOML and
-both YAML configuration files parse successfully.
-- The pinned Go 1.27.4 archive hashes match the checksums published by go.dev;
-the pinned Alpine and dnscrypt-proxy release metadata were checked against
-upstream sources.
+- `go test -count=1 ./...` passed on a temporary Go 1.23-compatible copy.
+- `go test -race -count=1 ./...` passed on that copy.
+- `go test -cover -count=1 ./...` passed with 86.1% statement coverage.
+- `go vet ./...` passed; `gofmt` reported no changes.
+- `FuzzParseDNSMessage` passed a 5-second run with 66,471 executions.
+- The workflow script passed `bash -n`; `entrypoint.sh` passed `sh -n`.
+- Workflow and Compose YAML parsed; `dnscrypt-proxy.toml` parsed successfully.
+- The keep-alive same-file concurrent-push simulation passed with a depth-1
+  clone and a local bare remote.
+- Official release pages were checked for Go 1.27.4, Alpine 3.24.4,
+  dnscrypt-proxy 2.1.20, and actions/checkout v7.0.1. The two Go archive
+  checksums in the Dockerfile match the official Go download listing.
 
 ### Not verified in this environment
 
-- Go tests/builds with the pinned Go 1.27.4 toolchain; the available local
-compiler is Go 1.23.2. Go checks were run on a disposable verification copy
-whose `go` directive alone was lowered to 1.23; the project's `go.mod` was not
-changed.
-- Docker image build or full container execution, validation with the actual
-pinned `dnscrypt-proxy -check` binary, and ShellCheck. Docker and ShellCheck are
-not installed in this environment.
+- The project declares Go 1.27, but only Go 1.23.2 is installed. Tests,
+  coverage, race detection, vet, formatting, and fuzzing ran in a disposable
+  copy with only its `go.mod` directive lowered to `go 1.23`; the submitted
+  module declaration remains `go 1.27`.
+- Docker, ShellCheck, and actionlint are unavailable. The Docker image build,
+  the dnscrypt-proxy `-check` against the built image, and hosted GitHub Actions
+  execution were not run. Repository branch-protection and ruleset behavior
+  cannot be established from the supplied archives.

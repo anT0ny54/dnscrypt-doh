@@ -1238,10 +1238,10 @@ func healthcheckURL() string {
 // 200 from making the container appear healthy.
 func runHealthcheck(target string) int {
 	client := &http.Client{
-		// This probe is only for the gateway's local listener. A zero-value
-		// Transport never reads proxy settings from the environment, and
-		// redirects are not followed, so a redirect to some other service
-		// cannot produce a false-positive health result.
+		// This probe is only for the gateway's local listener. Proxy is left
+		// unset, so the Transport never reads proxy settings from the
+		// environment. Redirects are not followed, so a redirect to some other
+		// service cannot produce a false-positive health result.
 		Transport: &http.Transport{
 			// The health endpoint is local, but a wrong listener on this port
 			// must not make a one-shot probe accept the transport's much larger default header allowance.

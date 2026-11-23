@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"io"
 	"math/rand"
@@ -162,6 +163,16 @@ func (r *countingReader) Read(p []byte) (int, error) {
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+// errReadCloser is a response body whose every read fails with err. It stands
+// in for an upstream body that the per-request deadline cut off mid-transfer.
+type errReadCloser struct {
+	err error
+}
+
+func (b errReadCloser) Read([]byte) (int, error) { return 0, b.err }
+
+func (errReadCloser) Close() error { return nil }
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
@@ -1904,6 +1915,55 @@ func TestDoHRejectsUpstreamRedirect(t *testing.T) {
 	s.doh(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+}
+
+// TestDoHUpstreamDeadlineReturnsGatewayTimeout checks that an upstream deadline
+// maps to 504, not 502, both when it expires before response headers arrive and
+// when it expires while the body is read. The request context is already past
+// its deadline, so each case fails at once instead of waiting out the real
+// 6-second upstream budget.
+func TestDoHUpstreamDeadlineReturnsGatewayTimeout(t *testing.T) {
+	query := testQuery(60)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	tests := []struct {
+		name      string
+		transport roundTripFunc
+	}{
+		{
+			name: "deadline before response headers",
+			transport: func(r *http.Request) (*http.Response, error) {
+				return nil, r.Context().Err()
+			},
+		},
+		{
+			name: "deadline while reading response body",
+			transport: func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Header:        http.Header{"Content-Type": []string{"application/dns-message"}},
+					ContentLength: -1,
+					Body:          errReadCloser{err: r.Context().Err()},
+					Request:       r,
+				}, nil
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestGateway("http://127.0.0.1:9/dns-query")
+			s.client.Transport = tc.transport
+			req := httptest.NewRequest(http.MethodPost, defaultDoHPath, strings.NewReader(string(query))).WithContext(ctx)
+			req.Header.Set("Content-Type", "application/dns-message")
+			rec := httptest.NewRecorder()
+			s.doh(rec, req)
+			if rec.Code != http.StatusGatewayTimeout {
+				t.Fatalf("status = %d, want 504; body=%s", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
 
